@@ -25,13 +25,34 @@ a different condition than the chords themselves, which strands a held
 Super whenever the pointer leaves the view.
 
 The HID-level event tap receives system Command shortcuts before normal host
-dispatch. When Accessibility permission is available, full grab therefore
-keeps those shortcuts with the focused guest as well.
+dispatch. When Accessibility permission is available, full grab keeps those
+shortcuts with the focused guest, except the complete Command-Tab interaction:
+Tab, optional Shift, and the final Command release remain with the host
+application switcher. Forwarding the final Command release through both paths
+also prevents either host or guest from retaining a stuck Command key.
+
+Ctrl+` is the other exception, and it comes from the other side of the
+keyboard: a host program that registers a global binding for the chord is fed
+from the same HID event stream the tap deletes events from, so swallowing it
+makes that binding unreachable for as long as the guest owns the keyboard.
+Full grab releases the chord to the host and the view consumes it without
+forwarding it to the guest, so neither the guest nor an unhandled responder
+sees the keystroke. The match is exact: with any other modifier the chord is a
+distinct keystroke that still belongs to the guest.
+
 
 diff --git a/ui/cocoa.m b/ui/cocoa.m
 --- a/ui/cocoa.m
 +++ b/ui/cocoa.m
-@@ -352,6 +352,7 @@
+@@ -109,6 +109,7 @@
+ static int left_command_key_enabled = 1;
+ static bool swap_opt_cmd;
+ static bool full_grab_enabled;
++static bool host_command_tab_active;
+ static bool immersive_mode_enabled = true;
+ static NSMenuItem *fullScreenMenuItem;
+ 
+@@ -353,16 +354,61 @@
  - (bool) handleEventLocked:(NSEvent *)event;
  - (void) notifyMouseModeChange;
  - (BOOL) isMouseGrabbed;
@@ -39,16 +60,62 @@ diff --git a/ui/cocoa.m b/ui/cocoa.m
  - (void) raiseAllKeys;
  @end
  
-@@ -361,7 +362,7 @@
+ QemuCocoaView *cocoaView;
++
++/*
++ * Ctrl+` belongs to the host. A host-side global binding that is fed from the
++ * event pipeline (a terminal emulator's quick terminal, for example) never
++ * sees a keystroke the full grab deletes, so the chord has to leave the guest
++ * path intact while the guest owns the keyboard. Match the chord exactly: any
++ * other modifier makes it a distinct keystroke that still belongs to the
++ * guest.
++ */
++static bool is_host_reserved_shortcut(NSEvent *event)
++{
++    NSEventType type = [event type];
++    NSEventModifierFlags chord = NSEventModifierFlagControl |
++                                 NSEventModifierFlagShift |
++                                 NSEventModifierFlagOption |
++                                 NSEventModifierFlagCommand;
+ 
++    return (type == NSEventTypeKeyDown || type == NSEventTypeKeyUp) &&
++           [event keyCode] == kVK_ANSI_Grave &&
++           ([event modifierFlags] & chord) == NSEventModifierFlagControl;
++}
++
+ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEventRef cgEvent, void *userInfo)
  {
      QemuCocoaView *view = userInfo;
      NSEvent *event = [NSEvent eventWithCGEvent:cgEvent];
 -    if ([view isMouseGrabbed] && [view handleEvent:event]) {
++
++    if (host_command_tab_active) {
++        if ([event type] == NSEventTypeFlagsChanged &&
++            ([event keyCode] == kVK_Command ||
++             [event keyCode] == kVK_RightCommand) &&
++            !([event modifierFlags] & NSEventModifierFlagCommand)) {
++            [view handleEvent:event];
++            host_command_tab_active = false;
++        }
++        return cgEvent;
++    }
++
++    if ([view isKeyboardCaptured] && is_host_reserved_shortcut(event)) {
++        return cgEvent;
++    }
++
++    if ([view isKeyboardCaptured] &&
++        [event type] == NSEventTypeKeyDown &&
++        [event keyCode] == kVK_Tab &&
++        ([event modifierFlags] & NSEventModifierFlagCommand)) {
++        host_command_tab_active = true;
++        return cgEvent;
++    }
 +    if ([view isKeyboardCaptured] && [view handleEvent:event]) {
          COCOA_DEBUG("Global events tap: qemu handled the event, capturing!\n");
          return NULL;
      }
-@@ -1031,10 +1032,9 @@
+@@ -1032,10 +1078,9 @@
                      }
                      break;
  
@@ -61,7 +128,7 @@ diff --git a/ui/cocoa.m b/ui/cocoa.m
                          !!(modifiers & NSEventModifierFlagCommand) &&
                          left_command_key_enabled) {
                          if (swap_opt_cmd) {
-@@ -1046,8 +1046,7 @@
+@@ -1047,8 +1092,7 @@
                      break;
  
                  case kVK_RightCommand:
@@ -71,19 +138,36 @@ diff --git a/ui/cocoa.m b/ui/cocoa.m
                          !!(modifiers & NSEventModifierFlagCommand)) {
                          if (swap_opt_cmd) {
                              [self toggleKey:KEY_RIGHTALT];
-@@ -1060,8 +1059,9 @@
+@@ -1062,8 +1106,17 @@
          case NSEventTypeKeyDown:
              keycode = cocoa_keycode_to_linux([event keyCode]);
  
 -            // Keep Command chords with the host unless full grab owns them.
 -            if ((!isMouseGrabbed || !full_grab_enabled) &&
++            // Ctrl+` is host-owned while the guest owns the keyboard. The tap
++            // has already released it to the host, so the guest must not also
++            // receive it; consuming it here keeps AppKit from treating the
++            // focused view as an unhandled responder and beeping.
++            if ([self isKeyboardCaptured] && is_host_reserved_shortcut(event)) {
++                return true;
++            }
++
 +            // Keep Command chords with the host unless the focused guest
 +            // captured the keyboard.
 +            if (![self isKeyboardCaptured] &&
                  ([event modifierFlags] & NSEventModifierFlagCommand)) {
                  return false;
              }
-@@ -1101,7 +1100,7 @@
+@@ -1098,10 +1151,16 @@
+             return true;
+         case NSEventTypeKeyUp:
+             keycode = cocoa_keycode_to_linux([event keyCode]);
++
++            // Same decision as the key-down: the guest never saw this key, so
++            // it must not see a release for it either.
++            if ([self isKeyboardCaptured] && is_host_reserved_shortcut(event)) {
++                return true;
++            }
  
              // don't pass the guest a spurious key-up if we treated this
              // command-key combo as a host UI action
@@ -92,10 +176,12 @@ diff --git a/ui/cocoa.m b/ui/cocoa.m
                  ([event modifierFlags] & NSEventModifierFlagCommand)) {
                  return true;
              }
-@@ -1295,6 +1294,24 @@
+@@ -1293,6 +1352,24 @@
+     }
+ }
  - (BOOL) isMouseGrabbed {return isMouseGrabbed;}
- 
- /*
++
++/*
 + * Keyboard capture is deliberately independent of the mouse grab. An
 + * absolute-pointing guest (virtio-tablet) makes notifyMouseModeChange drop
 + * the grab as soon as the guest driver comes up, and mouseExited drops it
@@ -112,8 +198,6 @@ diff --git a/ui/cocoa.m b/ui/cocoa.m
 +    return isMouseGrabbed ||
 +           (full_grab_enabled && [[self window] isKeyWindow]);
 +}
-+
-+/*
+ 
+ /*
   * Makes the target think all down keys are being released.
-  * This prevents a stuck key problem, since we will not see
-  * key up events for those keys after we have lost focus.

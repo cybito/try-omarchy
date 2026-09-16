@@ -46,7 +46,11 @@ make release \
 3. Verify networking, display scaling, keyboard/mouse, microphone and camera permission,
    on-demand FaceTime HD capture, audio-device changes, clipboard sharing in both
    directions, a shared folder read and written from both sides, persistence,
-   reset, and ephemeral mode. Exercise the SSH preset with a provisioned guest:
+   reset, and ephemeral mode. Confirm Command-Tab and Shift-Command-Tab switch
+   macOS applications and dismiss the switcher when Command is released, while
+   other focused Command chords still reach the guest, and that Ctrl+` still
+   reaches a host global binding while the guest owns the keyboard.
+   Exercise the SSH preset with a provisioned guest:
    confirm the listener is bound only to `127.0.0.1`, normal and ephemeral TCP
    mappings to guest port 22 work, UDP port 22 does not request sshd, a normal
    restart preserves the persistent VM, and the documented endpoint-specific
