@@ -57,8 +57,8 @@ struct FocusedCommandCaptureTests {
         #expect(!state.isCapturing)
     }
 
-    @Test("translates Command-Space after capture")
-    func translatesCommandSpace() {
+    @Test("routes received Command-Space to the guest, not the host")
+    func capturesCommandSpace() {
         let space: CGKeyCode = 49
         var state = FocusedCommandCaptureState()
 
@@ -79,6 +79,84 @@ struct FocusedCommandCaptureTests {
             space,
             marker: FocusedCommandCaptureState.recursionMarker
         )])
+        #expect(spaceDown.hostForwarded.isEmpty)
+    }
+
+    @Test("moves the complete Command-Tab lifecycle from guest to host")
+    func releasesCommandTabToHost() {
+        var state = FocusedCommandCaptureState()
+
+        _ = state.process(event(
+            .flagsChanged,
+            FocusedCommandCaptureState.leftCommand,
+            flags: [.maskCommand]
+        ), focused: true)
+        let tabDown = state.process(event(
+            .keyDown,
+            FocusedCommandCaptureState.tab,
+            flags: [.maskCommand]
+        ), focused: true)
+
+        #expect(tabDown.suppress)
+        #expect(tabDown.guestMeta == [.init(key: .left, down: false)])
+        #expect(tabDown.forwarded.isEmpty)
+        #expect(tabDown.hostForwarded == [
+            event(
+                .flagsChanged,
+                FocusedCommandCaptureState.leftCommand,
+                flags: [.maskCommand],
+                marker: FocusedCommandCaptureState.recursionMarker
+            ),
+            event(
+                .keyDown,
+                FocusedCommandCaptureState.tab,
+                flags: [.maskCommand],
+                marker: FocusedCommandCaptureState.recursionMarker
+            ),
+        ])
+
+        let tabUp = state.process(event(
+            .keyUp,
+            FocusedCommandCaptureState.tab,
+            flags: [.maskCommand]
+        ), focused: true)
+        #expect(tabUp.hostForwarded == [event(
+            .keyUp,
+            FocusedCommandCaptureState.tab,
+            flags: [.maskCommand],
+            marker: FocusedCommandCaptureState.recursionMarker
+        )])
+
+        let commandUp = state.process(event(
+            .flagsChanged,
+            FocusedCommandCaptureState.leftCommand
+        ), focused: false)
+        #expect(commandUp.hostForwarded == [event(
+            .flagsChanged,
+            FocusedCommandCaptureState.leftCommand,
+            marker: FocusedCommandCaptureState.recursionMarker
+        )])
+        #expect(!state.isCapturing)
+    }
+
+    @Test("keeps modified Command-Tab chords in the guest")
+    func capturesNonExactCommandTab() {
+        var state = FocusedCommandCaptureState()
+        _ = state.process(event(
+            .flagsChanged,
+            FocusedCommandCaptureState.leftCommand,
+            flags: [.maskCommand]
+        ), focused: true)
+
+        let optionCommandTab = state.process(event(
+            .keyDown,
+            FocusedCommandCaptureState.tab,
+            flags: [.maskCommand, .maskAlternate]
+        ), focused: true)
+
+        #expect(optionCommandTab.suppress)
+        #expect(optionCommandTab.hostForwarded.isEmpty)
+        #expect(optionCommandTab.forwarded.count == 1)
     }
 
     @Test("does not capture Command outside the focused QEMU window")

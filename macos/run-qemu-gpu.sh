@@ -1068,6 +1068,7 @@ work_dir=""
 owner_marker=""
 owner_token=""
 qemu_pid=""
+command_bridge_pid=""
 audio_bridge_pid=""
 authentication_bridge_pid=""
 camera_bridge_pid=""
@@ -1099,6 +1100,9 @@ cleanup() {
   set +e
   if [[ $network_link_bridge_pid =~ ^[0-9]+$ ]]; then
     terminate_child "$network_link_bridge_pid" 20
+  fi
+  if [[ $command_bridge_pid =~ ^[0-9]+$ ]]; then
+    terminate_child "$command_bridge_pid" 20
   fi
   if [[ $qemu_pid =~ ^[0-9]+$ ]]; then
     terminate_child "$qemu_pid" 40
@@ -1546,11 +1550,12 @@ qemu_args=(
   -device 'virtio-blk-pci,drive=omarchy-root,serial=omarchy-root'
   -device "$gpu_device"
   # Cocoa forwards its live backing-pixel dimensions and the current host
-  # display refresh rate through Virtio GPU EDID. Its accessibility-backed
-  # Full grab keeps every Command chord with the focused guest in either
-  # presentation mode. Immersive launches Full Screen and hard-hides the Mac
-  # menu bar and Dock; otherwise Cocoa opens a centered, resizable window.
-  -display "cocoa,gl=es,show-cursor=on,zoom-to-fit=on,full-screen=$cocoa_full_screen,full-grab=on,immersive=$cocoa_immersive,swap-opt-cmd=off"
+  # display refresh rate through Virtio GPU EDID. The companion HID-level
+  # bridge routes focused Command chords to guest Super before host launchers
+  # can consume them, while preserving the explicit host shortcuts.
+  # Immersive launches Full Screen and hard-hides the Mac menu bar and Dock;
+  # otherwise Cocoa opens a centered, resizable window.
+  -display "cocoa,gl=es,show-cursor=on,zoom-to-fit=on,full-screen=$cocoa_full_screen,full-grab=off,immersive=$cocoa_immersive,swap-opt-cmd=off"
   -device 'virtio-keyboard-pci,romfile='
   -device 'virtio-tablet-pci,romfile='
   -device 'virtio-pinch-pci,romfile='
@@ -1596,6 +1601,8 @@ fi
 if [[ ${OMARCHY_QEMU_GPU_DRY_RUN:-0} == 1 ]]; then
   printf '[qemu-gpu] dry-run command:' >&2
   printf ' %q' "$qemu_bin" "${qemu_args[@]}" >&2
+  printf '\n[qemu-gpu] command bridge: %q --bridge-command-super QEMU_PID %q' \
+    "$native_bridge" "$qmp_socket" >&2
   printf '\n[qemu-gpu] audio bridge command: %q --bridge-native-audio QEMU_PID %q %q' \
     "$native_bridge" "$audio_bridge_socket" "$audio_route_dir" >&2
   printf '\n[qemu-gpu] clipboard bridge command: %q --bridge-native-clipboard QEMU_PID %q' \
@@ -1646,8 +1653,10 @@ done
 [[ -S $clipboard_bridge_socket ]] || fail "QEMU did not create its private clipboard bridge socket"
 echo "[qemu-gpu] Ready. QMP: $qmp_socket" >&2
 
-# FD 9 deliberately remains open only in QEMU. Letting the sibling audio
-# bridge inherit it could keep a persistent workspace locked after QEMU exits.
+# FD 9 deliberately remains open only in QEMU. Letting sibling bridges
+# inherit it could keep a persistent workspace locked after QEMU exits.
+"$native_bridge" --bridge-command-super "$qemu_pid" "$qmp_socket" 9>&- &
+command_bridge_pid=$!
 "$native_bridge" --bridge-native-audio \
   "$qemu_pid" "$audio_bridge_socket" "$audio_route_dir" 9>&- &
 audio_bridge_pid=$!
@@ -1682,8 +1691,8 @@ start_camera_bridge() {
 start_camera_bridge
 camera_bridge_restarts=0
 
-# Bash 3.2 has no `wait -n`. The native-audio bridge is required for the guest
-# transport, so watch it alongside QEMU and fail if it exits unexpectedly.
+# Bash 3.2 has no `wait -n`. Input routing and native audio are required, so
+# watch both alongside QEMU and stop the session if either exits unexpectedly.
 while true; do
   qemu_state=$(ps -p "$qemu_pid" -o state= 2>/dev/null || true)
   [[ -n $qemu_state && $qemu_state != *Z* ]] || break
@@ -1695,6 +1704,17 @@ while true; do
   if [[ $QEMU_NETWORK_MODE == bridged && ( -f $QEMU_NETWORK_DIRECTORY/done || ! -d $QEMU_NETWORK_DIRECTORY ) ]]; then
     fail 'The networking session ended while Omarchy was running.'
   fi
+  command_bridge_state=$(ps -p "$command_bridge_pid" -o state= 2>/dev/null || true)
+  if [[ -z $command_bridge_state || $command_bridge_state == *Z* ]]; then
+    if wait "$command_bridge_pid"; then
+      command_bridge_status=0
+    else
+      command_bridge_status=$?
+    fi
+    command_bridge_pid=""
+    fail "Command-key bridge exited while QEMU was running (status $command_bridge_status)"
+  fi
+
   audio_bridge_state=$(ps -p "$audio_bridge_pid" -o state= 2>/dev/null || true)
   if [[ -z $audio_bridge_state || $audio_bridge_state == *Z* ]]; then
     if wait "$audio_bridge_pid"; then
@@ -1784,6 +1804,10 @@ else
   qemu_status=$?
 fi
 qemu_pid=""
+if [[ $command_bridge_pid =~ ^[0-9]+$ ]]; then
+  terminate_child "$command_bridge_pid" 20
+fi
+command_bridge_pid=""
 
 for ((attempt = 0; attempt < 40; attempt++)); do
   audio_bridge_state=$(ps -p "$audio_bridge_pid" -o state= 2>/dev/null || true)

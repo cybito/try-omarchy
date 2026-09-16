@@ -48,6 +48,7 @@ struct CommandBridgeOutcome: Equatable {
     var suppress = false
     var forwarded: [CommandBridgeEvent] = []
     var guestMeta: [GuestMetaTransition] = []
+    var hostForwarded: [CommandBridgeEvent] = []
 }
 
 /// Pure keyboard state used by the focused QEMU event tap.
@@ -60,17 +61,26 @@ struct FocusedCommandCaptureState {
     static let recursionMarker: Int64 = 0x004F_4D41_5243_4859
     static let leftCommand: CGKeyCode = 55
     static let rightCommand: CGKeyCode = 54
+    static let tab: CGKeyCode = 48
 
     private var commandKeys = Set<CGKeyCode>()
     private var forwardedKeys = Set<CGKeyCode>()
     private var forwardedModifiers = Set<CGKeyCode>()
+    private var hostCommandTabActive = false
+    private var hostCommandKey = Self.leftCommand
 
     var isCapturing: Bool {
-        !commandKeys.isEmpty || !forwardedKeys.isEmpty || !forwardedModifiers.isEmpty
+        hostCommandTabActive
+            || !commandKeys.isEmpty
+            || !forwardedKeys.isEmpty
+            || !forwardedModifiers.isEmpty
     }
 
     mutating func process(_ event: CommandBridgeEvent, focused: Bool) -> CommandBridgeOutcome {
         guard event.marker != Self.recursionMarker else { return CommandBridgeOutcome() }
+        if hostCommandTabActive {
+            return processHostCommandTab(event)
+        }
         guard focused else {
             var outcome = releaseAll()
             outcome.suppress = false
@@ -95,6 +105,29 @@ struct FocusedCommandCaptureState {
             commandKeys.insert(Self.leftCommand)
             outcome.guestMeta.append(.init(key: .left, down: true))
         }
+        if event.kind == .keyDown,
+           event.keyCode == Self.tab,
+           Self.isHostCommandTab(flags: event.flags) {
+            hostCommandKey = commandKeys.sorted().first ?? Self.leftCommand
+            var outcome = releaseAll()
+            hostCommandTabActive = true
+            outcome.suppress = true
+            outcome.hostForwarded = [
+                CommandBridgeEvent(
+                    kind: .flagsChanged,
+                    keyCode: hostCommandKey,
+                    flags: event.flags,
+                    marker: Self.recursionMarker
+                ),
+                CommandBridgeEvent(
+                    kind: .keyDown,
+                    keyCode: event.keyCode,
+                    flags: event.flags,
+                    marker: Self.recursionMarker
+                ),
+            ]
+            return outcome
+        }
 
         switch event.kind {
         case .keyDown:
@@ -114,6 +147,15 @@ struct FocusedCommandCaptureState {
 
     mutating func releaseAll() -> CommandBridgeOutcome {
         var outcome = CommandBridgeOutcome()
+        if hostCommandTabActive {
+            outcome.hostForwarded.append(CommandBridgeEvent(
+                kind: .flagsChanged,
+                keyCode: hostCommandKey,
+                flags: [],
+                marker: Self.recursionMarker
+            ))
+            hostCommandTabActive = false
+        }
         let metaIsDown = !commandKeys.isEmpty
         var flags: CGEventFlags = metaIsDown ? [.maskCommand] : []
 
@@ -149,8 +191,41 @@ struct FocusedCommandCaptureState {
 
     mutating func discardAll() {
         commandKeys.removeAll()
+        hostCommandTabActive = false
         forwardedKeys.removeAll()
         forwardedModifiers.removeAll()
+    }
+
+    private mutating func processHostCommandTab(
+        _ event: CommandBridgeEvent
+    ) -> CommandBridgeOutcome {
+        var outcome = CommandBridgeOutcome(suppress: true)
+        outcome.hostForwarded.append(CommandBridgeEvent(
+            kind: event.kind,
+            keyCode: event.keyCode,
+            flags: event.flags,
+            marker: Self.recursionMarker
+        ))
+        if event.kind == .flagsChanged,
+           (event.keyCode == Self.leftCommand || event.keyCode == Self.rightCommand),
+           !event.flags.contains(.maskCommand) {
+            hostCommandTabActive = false
+        }
+        return outcome
+    }
+
+    private static func isHostCommandTab(flags: CGEventFlags) -> Bool {
+        let modifiers = flags.intersection([
+            .maskAlphaShift,
+            .maskShift,
+            .maskControl,
+            .maskAlternate,
+            .maskCommand,
+            .maskHelp,
+            .maskSecondaryFn,
+        ])
+        return modifiers == [.maskCommand]
+            || modifiers == [.maskCommand, .maskShift]
     }
 
     private mutating func processCommand(
@@ -313,12 +388,18 @@ final class FocusedCommandSuperBridge {
     typealias FocusProbe = () -> Bool
     typealias ProcessAlive = () -> Bool
     typealias EventPost = (CGEvent, pid_t) -> Void
+    typealias HostEventPost = (CGEvent) -> Void
+
+    // Capture before macOS's session-level hot-key handling. This keeps
+    // Command-Space and other focused guest chords away from host launchers.
+    static let eventTapLocation: CGEventTapLocation = .cghidEventTap
 
     private let targetPID: pid_t
     private let metaClient: QMPMetaKeyClient
     private let focusProbe: FocusProbe
     private let processAlive: ProcessAlive
     private let postEvent: EventPost
+    private let postHostEvent: HostEventPost
     private var state = FocusedCommandCaptureState()
     private var tap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
@@ -333,6 +414,9 @@ final class FocusedCommandSuperBridge {
         processAlive: ProcessAlive? = nil,
         postEvent: @escaping EventPost = { event, processIdentifier in
             event.postToPid(processIdentifier)
+        },
+        postHostEvent: @escaping HostEventPost = { event in
+            event.post(tap: .cghidEventTap)
         }
     ) throws {
         guard let processIdentity = KernelProcessIdentity.capture(processIdentifier: targetPID),
@@ -346,6 +430,7 @@ final class FocusedCommandSuperBridge {
         }
         self.processAlive = processAlive ?? { processIdentity.isStillRunning }
         self.postEvent = postEvent
+        self.postHostEvent = postHostEvent
     }
 
     deinit {
@@ -357,7 +442,7 @@ final class FocusedCommandSuperBridge {
             | (UInt64(1) << CGEventType.keyUp.rawValue)
             | (UInt64(1) << CGEventType.flagsChanged.rawValue)
         guard let eventTap = CGEvent.tapCreate(
-            tap: .cgSessionEventTap,
+            tap: Self.eventTapLocation,
             place: .headInsertEventTap,
             options: .defaultTap,
             eventsOfInterest: eventMask,
@@ -442,7 +527,8 @@ final class FocusedCommandSuperBridge {
             flags: event.flags,
             marker: event.getIntegerValueField(.eventSourceUserData)
         )
-        let outcome = state.process(input, focused: focusProbe())
+        let focused = focusProbe()
+        let outcome = state.process(input, focused: focused)
         do {
             try apply(outcome, sourceEvent: event)
         } catch {
@@ -486,6 +572,18 @@ final class FocusedCommandSuperBridge {
             event.flags = forwarded.flags
             event.setIntegerValueField(.eventSourceUserData, value: forwarded.marker)
             postEvent(event, targetPID)
+        }
+        for forwarded in outcome.hostForwarded {
+            let event = CGEvent(
+                keyboardEventSource: nil,
+                virtualKey: forwarded.keyCode,
+                keyDown: forwarded.kind != .keyUp
+            )
+            guard let event else { continue }
+            event.type = forwarded.kind.cgEventType
+            event.flags = forwarded.flags
+            event.setIntegerValueField(.eventSourceUserData, value: forwarded.marker)
+            postHostEvent(event)
         }
     }
 
