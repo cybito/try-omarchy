@@ -147,8 +147,8 @@ log() {
 # shellcheck source=macos/pinned-runtime-bottles.sh
 source "$pinned_bottles"
 
-for tool in awk bash chmod curl ditto file grep install mkdir mktemp patch \
-  pkg-config python3 rm sed shasum sw_vers tar uname; do
+for tool in awk bash chmod codesign curl ditto file grep install install_name_tool \
+  mkdir mktemp otool patch pkg-config python3 rm sed shasum sw_vers tar uname; do
   command -v "$tool" >/dev/null 2>&1 || die "required tool is unavailable: $tool"
 done
 
@@ -483,8 +483,28 @@ env MACOSX_DEPLOYMENT_TARGET="$macos_deployment_target" \
   python3 "$meson" setup "$slirp_build" "$source_parent/$slirp_source_root" \
     --prefix="$slirp_root" --libdir=lib --buildtype=release --wrap-mode=nodownload
 "$ninja" -C "$slirp_build"
+for image in \
+  "$slirp_build"/libslirp.0.dylib \
+  "$slirp_build"/*test \
+  "$glib_root/lib/libglib-2.0.0.dylib" \
+  "$pcre2_root/lib/libpcre2-8.0.dylib"; do
+  [[ -f $image ]] || continue
+  install_name_tool -change \
+    '@@HOMEBREW_PREFIX@@/opt/glib/lib/libglib-2.0.0.dylib' \
+    "$glib_root/lib/libglib-2.0.0.dylib" "$image"
+  install_name_tool -change \
+    '@@HOMEBREW_PREFIX@@/opt/gettext/lib/libintl.8.dylib' \
+    "$gettext_root/lib/libintl.8.dylib" "$image"
+  install_name_tool -change \
+    '@@HOMEBREW_PREFIX@@/opt/pcre2/lib/libpcre2-8.0.dylib' \
+    "$pcre2_root/lib/libpcre2-8.0.dylib" "$image"
+  codesign --force --sign - "$image"
+done
 # The explicit build above completed the test binaries using our private Ninja.
-env DYLD_LIBRARY_PATH="$slirp_build:$private_libraries" \
+# Homebrew bottle install names retain the formula-relative `/lib` suffix;
+# include each extracted formula root so dyld can resolve that suffix during
+# the pre-install test run.
+env DYLD_LIBRARY_PATH="$slirp_build:$glib_root:$gettext_root:$pcre2_root:$private_libraries" \
   python3 "$meson" test -C "$slirp_build" --no-rebuild --print-errorlogs
 python3 "$meson" install -C "$slirp_build" --no-rebuild
 
