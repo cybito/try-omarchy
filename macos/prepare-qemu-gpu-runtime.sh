@@ -4,18 +4,20 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: macos/prepare-qemu-gpu-runtime.sh --source-qemu PATH [--archive-dir DIR]
+Usage: macos/prepare-qemu-gpu-runtime.sh --source-qemu PATH --source-slirp PATH [--archive-dir DIR]
 
 Stage, relocate, validate, and ad-hoc sign the source-built QEMU runtime at:
   macos/.build/qemu-gpu-runtime
 
-The complete runtime closure comes from checksum-pinned arm64_sequoia bottles;
+QEMU and libslirp are source-built; the remaining runtime closure comes from
+checksum-pinned arm64_sequoia bottles;
 it never reads or bundles libraries from the build machine's Homebrew prefix.
 With --archive-dir, reuse pinned archives from DIR after verifying every hash.
 EOF
 }
 
 source_qemu=
+source_slirp=
 archive_cache=
 while (($#)); do
   case "$1" in
@@ -23,6 +25,12 @@ while (($#)); do
       (($# >= 2)) || { usage >&2; exit 64; }
       [[ -z $source_qemu ]] || { usage >&2; exit 64; }
       source_qemu=$2
+      shift 2
+      ;;
+    --source-slirp)
+      (($# >= 2)) || { usage >&2; exit 64; }
+      [[ -z $source_slirp ]] || { usage >&2; exit 64; }
+      source_slirp=$2
       shift 2
       ;;
     --archive-dir)
@@ -90,6 +98,9 @@ done
 macos_major=$(sw_vers -productVersion | awk -F. '{ print $1 }')
 [[ $macos_major =~ ^[0-9]+$ ]] || die "could not determine the macOS version"
 ((macos_major >= 15)) || die "the pinned arm64_sequoia bottles require macOS 15 or newer"
+[[ -n $source_slirp ]] || die "--source-slirp is required"
+[[ $source_slirp == /* && -f $source_slirp && ! -L $source_slirp ]] || \
+  die "--source-slirp must name an absolute regular library path"
 [[ -n $source_qemu ]] || die "--source-qemu is required"
 [[ $source_qemu == /* ]] || die "--source-qemu must be an absolute path"
 [[ -f $source_qemu && ! -L $source_qemu && -x $source_qemu ]] || \
@@ -229,6 +240,10 @@ install -m 0755 "$extract_dir/$egl_member" "$staged_runtime/lib/libEGL.dylib"
 install -m 0755 "$extract_dir/$gles_member" "$staged_runtime/lib/libGLESv2.dylib"
 
 while IFS=$'\t' read -r archive_name member destination; do
+  if [[ $destination == lib/libslirp.0.dylib ]]; then
+    install -m 0755 "$source_slirp" "$staged_runtime/$destination"
+    continue
+  fi
   archive="$archive_dir/$archive_name"
   pinned_bottle_require_regular_member "$archive_name" "$archive" "$member"
   tar -xzf "$archive" -C "$extract_dir" "$member"

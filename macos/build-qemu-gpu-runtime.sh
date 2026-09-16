@@ -53,6 +53,8 @@ pinch_patch="$native_dir/patches/qemu-cocoa-pinch-zoom.patch"
 audio_device_patch="$native_dir/patches/qemu-sdl-audio-device-selection.patch"
 shared_folder_patch="$native_dir/patches/qemu-9p-guest-owner.patch"
 strchrnul_patch="$native_dir/patches/qemu-darwin-strchrnul-compat.patch"
+slirp_patch="$native_dir/patches/libslirp-darwin-icmp-matching.patch"
+udp_patch="$native_dir/patches/libslirp-ipv4-udp-translation.patch"
 prepare_runtime="$native_dir/prepare-qemu-gpu-runtime.sh"
 pinned_bottles="$native_dir/pinned-runtime-bottles.sh"
 
@@ -73,6 +75,16 @@ pinch_patch_sha256=37acb8895dddd35fc66812d0c49ec5fc697f9127e9e12ed2e60d17999bf32
 audio_device_patch_sha256=03aca71c26163c337338cc3b2013c35430690fc0e8b66c5ce92a42f59a9b3334
 shared_folder_patch_sha256=41247692501655393ae3a40f56915472ab29b6e89c5173e33db1f62cca56632f
 strchrnul_patch_sha256=ec1048dd0e8ebe53bf7e8a3bca9bf2f5f4336cd607d4cd077437470e9a32094a
+udp_patch_sha256=95e8ee890be78cdce70b3ee54a8adac27be02421be08b986ae987c74ef8cec8c
+slirp_patch_sha256=20f3d424c79929fb82d240d0ee06b99e9f93ecfb9460579dc414303820d59f90
+slirp_source_root=libslirp-v4.9.4
+slirp_archive_name="$slirp_source_root.tar.gz"
+slirp_url="https://gitlab.freedesktop.org/slirp/libslirp/-/archive/v4.9.4/$slirp_archive_name"
+slirp_sha256=3998863b020aeda34bddc567097c6efba55a78cdf6eeee6bcd42c11ef23967da
+meson_root=meson-1.9.0
+meson_archive_name="$meson_root.tar.gz"
+meson_url="https://github.com/mesonbuild/meson/releases/download/1.9.0/$meson_archive_name"
+meson_sha256=cd27277649b5ed50d19875031de516e270b22e890d9db65ed9af57d18ebc498d
 macos_deployment_target=15.0
 
 keycodemap_commit=f5772a62ec52591ff6870b7e8ef32482371f22c6
@@ -274,6 +286,8 @@ validate_tar_root() {
   done <"$listing"
 }
 
+slirp_archive="$archive_dir/$slirp_archive_name"
+meson_archive="$archive_dir/$meson_archive_name"
 qemu_archive="$archive_dir/$qemu_archive_name"
 keycodemap_archive="$archive_dir/$keycodemap_archive_name"
 dtc_archive="$archive_dir/$dtc_archive_name"
@@ -285,6 +299,8 @@ setuptools_archive="$archive_dir/$setuptools_archive_name"
 wheel_archive="$archive_dir/$wheel_archive_name"
 pip_archive="$archive_dir/$pip_archive_name"
 
+obtain_and_verify "libslirp source" "$slirp_url" "$slirp_sha256" "$slirp_archive"
+obtain_and_verify "Meson" "$meson_url" "$meson_sha256" "$meson_archive"
 obtain_and_verify "QEMU $qemu_commit" "$qemu_url" "$qemu_sha256" "$qemu_archive"
 obtain_and_verify "keycodemapdb $keycodemap_commit" "$keycodemap_url" "$keycodemap_sha256" "$keycodemap_archive"
 obtain_and_verify "dtc $dtc_commit" "$dtc_url" "$dtc_sha256" "$dtc_archive"
@@ -311,6 +327,14 @@ validate_tar_root "virglrenderer" "$virgl_archive" "virglrenderer/$virgl_version
 validate_tar_root "ANGLE" "$angle_archive" "angle/$angle_version" "$listing_dir/angle.txt"
 validate_tar_root "libepoxy" "$epoxy_archive" "libepoxy/$epoxy_version" "$listing_dir/libepoxy.txt"
 
+validate_tar_root "libslirp source" "$slirp_archive" "$slirp_source_root" "$listing_dir/slirp.txt"
+validate_tar_root "Meson" "$meson_archive" "$meson_root" "$listing_dir/meson.txt"
+tar -xzf "$slirp_archive" -C "$source_parent"
+tar -xzf "$meson_archive" -C "$tool_root"
+verify_file_sha "Darwin ICMP reply matching patch" "$slirp_patch" "$slirp_patch_sha256"
+patch -d "$source_parent/$slirp_source_root" -p1 -f -i "$slirp_patch"
+verify_file_sha "IPv4 UDP reply translation patch" "$udp_patch" "$udp_patch_sha256"
+patch -d "$source_parent/$slirp_source_root" -p1 -f -i "$udp_patch"
 tar -xzf "$qemu_archive" -C "$source_parent"
 tar -xzf "$virgl_archive" -C "$dependency_root"
 tar -xzf "$angle_archive" -C "$dependency_root"
@@ -446,6 +470,24 @@ require_private_pkg_version sdl2 2.32.70
 require_private_pkg_version virglrenderer 1.2.0
 require_private_pkg_version epoxy 1.5.11
 
+# Build against the same pinned private GLib used by QEMU; never use host libraries.
+slirp_build="$source_parent/$slirp_source_root/build"
+meson="$tool_root/$meson_root/meson.py"
+log "Building patched libslirp 4.9.4 for macOS $macos_deployment_target"
+env MACOSX_DEPLOYMENT_TARGET="$macos_deployment_target" \
+  PKG_CONFIG_PATH= PKG_CONFIG_LIBDIR="$pkg_config_libdir" \
+  DYLD_LIBRARY_PATH="$private_libraries" \
+  PATH="$(dirname "$ninja"):$PATH" \
+  CFLAGS="-mmacosx-version-min=$macos_deployment_target -Werror=unguarded-availability-new" \
+  LDFLAGS="-mmacosx-version-min=$macos_deployment_target -Wl,-headerpad_max_install_names" \
+  python3 "$meson" setup "$slirp_build" "$source_parent/$slirp_source_root" \
+    --prefix="$slirp_root" --libdir=lib --buildtype=release --wrap-mode=nodownload
+"$ninja" -C "$slirp_build"
+# The explicit build above completed the test binaries using our private Ninja.
+env DYLD_LIBRARY_PATH="$slirp_build:$private_libraries" \
+  python3 "$meson" test -C "$slirp_build" --no-rebuild --print-errorlogs
+python3 "$meson" install -C "$slirp_build" --no-rebuild
+
 build_dir="$source_dir/build"
 mkdir "$build_dir"
 log "Configuring QEMU 11.1.1 (HVF-only, Cocoa/VirGL, SLIRP, SDL audio, virtio-9p) for macOS $macos_deployment_target and newer"
@@ -538,6 +580,7 @@ description=$(file -b "$qemu_binary")
 log "Relocating, capability-gating, signing, and publishing the runtime"
 "$prepare_runtime" \
   --source-qemu "$qemu_binary" \
+  --source-slirp "$slirp_root/lib/libslirp.0.dylib" \
   --archive-dir "$archive_dir"
 
 log "Pinned patched runtime is ready; scratch source and archives will now be removed"

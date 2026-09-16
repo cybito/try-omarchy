@@ -749,16 +749,16 @@ vivaldi = exact_keys(
     "build spec Vivaldi component",
 )
 if vivaldi != {
-    "version": "8.2.4133.33",
+    "version": "8.2.4133.52",
     "rpmRelease": 1,
-    "pkgrel": 2,
+    "pkgrel": 1,
     "repository": "https://repo.vivaldi.com/stable",
-    "rpmUrl": "https://downloads.vivaldi.com/stable/vivaldi-stable-8.2.4133.33-1.aarch64.rpm",
-    "rpmSha256": "99fe7542199ba11d16d9af02783540c8c03554c37d80597a219595751414503d",
+    "rpmUrl": "https://downloads.vivaldi.com/stable/vivaldi-stable-8.2.4133.52-1.aarch64.rpm",
+    "rpmSha256": "999e0de90883041906ccb3f9a62972318743d819b465a4e788329bb53ffa9a9a",
     "signingKey": "keys/vivaldi-package-composer-key11.asc",
     "signingKeySha256": "5c67d85c0aca9c0d166edb5bc5e6ebc21d67bce4e67c645e7bd76d299fd337ef",
     "signingFingerprint": "8D1FA52AEF58A09D889DD4221256C34716BD9233",
-    "reportedVersion": "Vivaldi 8.2.4133.33",
+    "reportedVersion": "Vivaldi 8.2.4133.52",
     "license": "Multiple, see https://www.vivaldi.com/",
 }:
     fail("Vivaldi installer is not pinned to the reviewed signed ARM64 release")
@@ -939,14 +939,24 @@ fi
 source "$storage_library"
 # shellcheck source=qemu-port-forwarding.sh
 source "$port_forwarding_library"
+source "$script_dir/qemu-networking.sh"
+qemu_network_validate
+if [[ $QEMU_NETWORK_MODE == bridged ]]; then
+  printf '%s\n' "$qemu_netdevs" | grep -qx stream || fail 'The bundled QEMU does not support bridged networking. Rebuild the runtime.'
+fi
 
-if ! qemu_port_forwarding_configure "${OMARCHY_QEMU_GPU_PORT_FORWARDS:-}"; then
+network_forwards=${OMARCHY_QEMU_GPU_PORT_FORWARDS:-}
+[[ $QEMU_NETWORK_MODE == nat ]] || network_forwards=
+if ! qemu_port_forwarding_configure "$network_forwards"; then
   fail "$QEMU_PORT_FORWARDING_ERROR"
 fi
 qemu_netdev=$QEMU_PORT_FORWARDING_NETDEV
 port_forwarding_summary=$QEMU_PORT_FORWARDING_SUMMARY
 ssh_kernel_argument=''
 if ((QEMU_PORT_FORWARDING_ENABLES_SSH)); then
+  ssh_kernel_argument=' tryomarchy.ssh_access=1'
+fi
+if [[ $QEMU_NETWORK_MODE == bridged && $QEMU_NETWORK_SSH == 1 ]]; then
   ssh_kernel_argument=' tryomarchy.ssh_access=1'
 fi
 
@@ -971,15 +981,18 @@ vcpu_count=${OMARCHY_QEMU_GPU_CPUS-$default_vcpu_count}
   fail "OMARCHY_QEMU_GPU_CPUS must be between 4 and $host_cpu_count"
 }
 
-# Guest memory is a boot-time allocation. The Swift app resolves the user's
-# stored choice against this host before exporting it; re-check independently
-# here so a hand-set environment value can never start a guest below the
-# manifest's minimumMemoryMiB or starve the host. The 4096 default matches the
-# manifest's recommendedMemoryMiB, both verified at build time. The host cap
-# applies only above the default: 4096 has always booted unconditionally, and
-# hosts smaller than 8 GiB exist (CI runners), so gating the default on host
-# size would be a regression, not a safeguard.
-memory_mib=${OMARCHY_QEMU_GPU_MEMORY_MIB:-4096}
+# Match the app's host-aware default and independently validate scripted
+# allocations. The guest manifest's 4096 MiB recommendation is the baseline;
+# Macs with at least 16 GiB default to 8 GiB. Keep 4 GiB for macOS above the
+# baseline, while retaining support for smaller hosts such as CI runners.
+host_memory_bytes=$(sysctl -n hw.memsize 2>/dev/null) || fail "cannot determine the host memory size"
+[[ $host_memory_bytes =~ ^[1-9][0-9]{0,17}$ ]] || fail "host memory size is invalid: $host_memory_bytes"
+host_memory_mib=$((host_memory_bytes / 1048576))
+default_memory_mib=4096
+if (( host_memory_mib >= 16384 )); then
+  default_memory_mib=8192
+fi
+memory_mib=${OMARCHY_QEMU_GPU_MEMORY_MIB:-$default_memory_mib}
 # Seven digits bound the value below any real host while keeping the
 # arithmetic far from 64-bit wraparound; forcing base 10 stops bash from
 # reading a leading zero as octal while QEMU would read the same string as
@@ -988,9 +1001,6 @@ memory_mib=${OMARCHY_QEMU_GPU_MEMORY_MIB:-4096}
 memory_mib=$((10#$memory_mib))
 (( memory_mib >= 2048 )) || fail "the ARM guest requires at least 2048 MiB of memory"
 if (( memory_mib > 4096 )); then
-  host_memory_bytes=$(sysctl -n hw.memsize 2>/dev/null) || fail "cannot determine the host memory size"
-  [[ $host_memory_bytes =~ ^[1-9][0-9]{0,17}$ ]] || fail "host memory size is invalid: $host_memory_bytes"
-  host_memory_mib=$((host_memory_bytes / 1048576))
   (( memory_mib + 4096 <= host_memory_mib )) || {
     fail "OMARCHY_QEMU_GPU_MEMORY_MIB must leave the host at least 4096 MiB (host has ${host_memory_mib} MiB)"
   }
@@ -1062,6 +1072,7 @@ audio_bridge_pid=""
 authentication_bridge_pid=""
 camera_bridge_pid=""
 clipboard_bridge_pid=""
+network_link_bridge_pid=""
 
 terminate_child() {
   local pid=$1
@@ -1086,6 +1097,9 @@ cleanup() {
   local status=$?
   trap - EXIT HUP INT TERM
   set +e
+  if [[ $network_link_bridge_pid =~ ^[0-9]+$ ]]; then
+    terminate_child "$network_link_bridge_pid" 20
+  fi
   if [[ $qemu_pid =~ ^[0-9]+$ ]]; then
     terminate_child "$qemu_pid" 40
   fi
@@ -1101,6 +1115,7 @@ cleanup() {
   if [[ $clipboard_bridge_pid =~ ^[0-9]+$ ]]; then
     terminate_child "$clipboard_bridge_pid" 20
   fi
+  qemu_network_stop || status=1
   qemu_persistent_storage_release_lock
   if [[ -n $work_dir && -n $owner_marker && -n $owner_token ]]; then
     case "$work_dir" in
@@ -1129,6 +1144,11 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 reap_stale_work_dirs() {
+  local process_snapshot=""
+  if ! process_snapshot=$(ps -axo pid=,command= 2>/dev/null); then
+    echo '[qemu-gpu] Process inspection unavailable; leaving other run directories intact.' >&2
+    return 0
+  fi
   local candidate=""
   local marker=""
   local marker_value=""
@@ -1149,14 +1169,14 @@ reap_stale_work_dirs() {
     [[ $marker_value =~ ^run-qemu-gpu:v1:([0-9]+):([0-9]+)$ ]] || continue
 
     launcher_pid=${BASH_REMATCH[1]}
-    launcher_command=$(ps -p "$launcher_pid" -o command= 2>/dev/null || true)
+    launcher_command=$(printf '%s\n' "$process_snapshot" | awk -v pid="$launcher_pid" '$1 == pid { $1=""; print }')
     [[ $launcher_command != *"run-qemu-gpu.sh"* ]] || continue
 
     qemu_marker="$candidate/.qemu.pid"
     if [[ -f $qemu_marker && ! -L $qemu_marker ]]; then
       stale_qemu_pid=$(<"$qemu_marker")
       if [[ $stale_qemu_pid =~ ^[0-9]+$ ]]; then
-        qemu_command=$(ps -p "$stale_qemu_pid" -o command= 2>/dev/null || true)
+        qemu_command=$(printf '%s\n' "$process_snapshot" | awk -v pid="$stale_qemu_pid" '$1 == pid { $1=""; print }')
         if [[ $qemu_command == *"$qemu_bin"* &&
               $qemu_command == *"unix:/tmp/${candidate##*/}/qmp.sock"* ]]; then
           continue
@@ -1448,11 +1468,16 @@ case ${OMARCHY_QEMU_GPU_IMMERSIVE:-1} in
   *) fail "OMARCHY_QEMU_GPU_IMMERSIVE must be 0 or 1" ;;
 esac
 
-# M3 and newer Apple Silicon can expose EL2 to this Linux guest. Probe the
-# actual Hypervisor.framework capability instead of guessing from a model name;
-# older Apple Silicon keeps the existing platform-GIC/EL1 launch path.
+# macOS 15 can pass the paused EL2 probe, then abort with HV_BAD_ARGUMENT when
+# QEMU synchronizes vCPU registers (#211). Keep it on the platform-GIC/EL1 path.
+# On macOS 26+, probe actual Hypervisor.framework support for EL2 rather than
+# guessing from a model name; older Apple Silicon still falls back to EL1.
+host_macos_version=$(sw_vers -productVersion 2>/dev/null) || host_macos_version=''
+host_macos_major=${host_macos_version%%.*}
 qemu_virtualization_args=(-machine "$qemu_machine")
-if printf '%s\n' \
+if [[ $host_macos_major =~ ^[1-9][0-9]*$ ]] && \
+  (( host_macos_major >= 26 )) && \
+  printf '%s\n' \
     '{"execute":"qmp_capabilities"}' \
     '{"execute":"quit"}' | \
   "$qemu_bin" \
@@ -1484,6 +1509,17 @@ if [[ -f $console_log ]]; then
 fi
 console_log_option=${console_log//,/,,}
 
+network_mac=$(qemu_network_mac) || fail 'Cannot prepare the VM network identity.'
+if [[ $QEMU_NETWORK_MODE == bridged ]]; then
+  port_forwarding_summary='inactive in bridged mode'
+  if [[ ${OMARCHY_QEMU_GPU_DRY_RUN:-0} == 1 ]]; then
+    qemu_netdev='stream,id=omarchy-net,server=off,addr.type=unix,addr.path=/private/tmp/bridge-dry-run/network.sock'
+  else
+    qemu_network_start "$contents_dir/Resources" "$work_dir"
+    qemu_netdev=$QEMU_NETWORK_NETDEV
+  fi
+fi
+
 qemu_args=(
   -name 'Try Omarchy'
   "${qemu_virtualization_args[@]}"
@@ -1496,7 +1532,7 @@ qemu_args=(
   # Reboot the guest inside this QEMU process, but let shutdown close the app.
   -action 'reboot=reset,shutdown=poweroff'
   -netdev "$qemu_netdev"
-  -device 'virtio-net-pci,netdev=omarchy-net,mac=52:54:00:12:34:56,romfile='
+  -device "virtio-net-pci,id=omarchy-nic,netdev=omarchy-net,mac=$network_mac,romfile="
   -audiodev 'sdl,id=omarchy-audio'
   -device 'intel-hda,id=omarchy-hda,romfile='
   -device 'hda-micro,bus=omarchy-hda.0,audiodev=omarchy-audio'
@@ -1632,6 +1668,12 @@ start_authentication_bridge() {
 start_authentication_bridge
 authentication_bridge_restarts=0
 
+if [[ $QEMU_NETWORK_MODE == bridged ]]; then
+  "$native_bridge" --bridge-network-link "$qemu_pid" "$qmp_socket" \
+    "$QEMU_NETWORK_DIRECTORY/link-state" 9>&- &
+  network_link_bridge_pid=$!
+fi
+
 start_camera_bridge() {
   "$native_bridge" --bridge-native-camera \
     "$qemu_pid" "$camera_bridge_socket" 9>&- &
@@ -1646,6 +1688,13 @@ while true; do
   qemu_state=$(ps -p "$qemu_pid" -o state= 2>/dev/null || true)
   [[ -n $qemu_state && $qemu_state != *Z* ]] || break
 
+  if [[ $QEMU_NETWORK_MODE == bridged && -f $QEMU_NETWORK_DIRECTORY/failed ]]; then
+    cat "$QEMU_NETWORK_DIRECTORY/log" >&2
+    fail 'The network helper stopped while Omarchy was running.'
+  fi
+  if [[ $QEMU_NETWORK_MODE == bridged && ( -f $QEMU_NETWORK_DIRECTORY/done || ! -d $QEMU_NETWORK_DIRECTORY ) ]]; then
+    fail 'The networking session ended while Omarchy was running.'
+  fi
   audio_bridge_state=$(ps -p "$audio_bridge_pid" -o state= 2>/dev/null || true)
   if [[ -z $audio_bridge_state || $audio_bridge_state == *Z* ]]; then
     if wait "$audio_bridge_pid"; then
@@ -1654,6 +1703,12 @@ while true; do
       audio_bridge_status=$?
     fi
     audio_bridge_pid=""
+    for ((attempt = 0; attempt < 20; attempt++)); do
+      qemu_state=$(ps -p "$qemu_pid" -o state= 2>/dev/null || true)
+      [[ -n $qemu_state && $qemu_state != *Z* ]] || break
+      sleep 0.05
+    done
+    [[ -n $qemu_state && $qemu_state != *Z* ]] || break
     fail "native audio bridge exited while QEMU was running (status $audio_bridge_status)"
   fi
 
