@@ -1,0 +1,319 @@
+From: Try Omarchy custom
+Subject: [PATCH] cocoa: reserve Command-Tab and Control-grave for macOS
+
+Applies after the upstream Cocoa patches. Reuse QEMU's existing HID tap
+without synthetic events or a companion input process. Preserve key ownership
+through repeats and releases, and share modifier releases with guest state.
+
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -444,44 +444,97 @@
+ - (bool) handlePinchLocked:(NSEvent *)event;
+ @end
+ 
+ QemuCocoaView *cocoaView;
+ static VMChangeStateEntry *pinch_vm_change;
+ 
+ /* VM state callbacks hold the BQL; this method only touches input state. */
+ static void cocoa_pinch_vm_change(void *opaque, bool running, RunState state)
+ {
+     [cocoaView resetPinchLocked:running];
+ }
+ 
++static NSEventModifierFlags host_shortcut_modifiers;
++static bool host_tab_key, host_grave_key;
++
++/*
++ * The initial key-down owns the whole press, including repeats and key-up
++ * after its modifiers change. Keep that decision until the next key-down:
++ * the same event can visit both the HID tap and the Cocoa view.
++ */
++static bool cocoa_is_host_shortcut(NSEvent *event)
++{
++    NSEventType type = [event type];
++    if (type != NSEventTypeKeyDown && type != NSEventTypeKeyUp) {
++        return false;
++    }
++    unsigned short key = [event keyCode];
++    bool *host;
++    if (key == kVK_Tab) {
++        host = &host_tab_key;
++    } else if (key == kVK_ANSI_Grave) {
++        host = &host_grave_key;
++    } else {
++        return false;
++    }
++    if (type == NSEventTypeKeyDown && ![event isARepeat]) {
++        NSEventModifierFlags chord = [event modifierFlags] &
++            (NSEventModifierFlagShift | NSEventModifierFlagControl |
++             NSEventModifierFlagOption | NSEventModifierFlagCommand |
++             NSEventModifierFlagFunction);
++        *host = key == kVK_Tab ?
++            (chord == NSEventModifierFlagCommand ||
++             chord == (NSEventModifierFlagCommand | NSEventModifierFlagShift)) :
++            chord == NSEventModifierFlagControl;
++        if (*host) {
++            host_shortcut_modifiers |= chord &
++                (NSEventModifierFlagCommand | NSEventModifierFlagControl);
++        }
++    }
++    return *host;
++}
++
+ 
+ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEventRef cgEvent, void *userInfo)
+ {
+     QemuCocoaView *view = userInfo;
+ 
+     /*
+      * macOS owns the tap's lifetime. A callback that returns too slowly
+      * gets the tap disabled with kCGEventTapDisabledByTimeout, and a tap
+      * can also be disabled with kCGEventTapDisabledByUserInput. Neither
+      * notification is a key event, so +[NSEvent eventWithCGEvent:] returns
+      * nil below and handleEvent would report that nothing was consumed,
+      * leaving the tap dead for the rest of the session. Turn it back on.
+      */
+     if (type == kCGEventTapDisabledByTimeout ||
+         type == kCGEventTapDisabledByUserInput) {
+         [view reenableEventTap];
+         return cgEvent;
+     }
+ 
+     NSEvent *event = [NSEvent eventWithCGEvent:cgEvent];
++    if (type == kCGEventFlagsChanged &&
++        (host_shortcut_modifiers & ~[event modifierFlags])) {
++        if ([view isKeyboardCaptured]) {
++            [view handleEvent:event];
++        } else {
++            [view raiseAllKeys];
++        }
++        host_shortcut_modifiers &= [event modifierFlags];
++        return cgEvent;
++    }
++    if ([view isKeyboardCaptured] && cocoa_is_host_shortcut(event)) {
++        return cgEvent;
++    }
+     if ([view isKeyboardCaptured] && [view handleEvent:event]) {
+         COCOA_DEBUG("Global events tap: qemu handled the event, capturing!\n");
+         return NULL;
+     }
+     COCOA_DEBUG("Global events tap: qemu did not handle the event, letting it through...\n");
+ 
+     return cgEvent;
+ }
+ 
+ /* Called under the same BQL as normal Cocoa input. */
+ static void cocoa_pinch_send_frame(void *opaque, const CocoaPinchFrame *frame)
+ {
+@@ -1170,207 +1223,211 @@
+ - (bool) handleEventLocked:(NSEvent *)event
+ {
+     /* Return true if we handled the event, false if it should be given to OSX */
+     COCOA_DEBUG("QemuCocoaView: handleEvent\n");
+     InputButton button;
+     unsigned int keycode;
+     NSUInteger modifiers = [event modifierFlags];
+ 
+     /*
+      * Check -[NSEvent modifierFlags] here.
+      *
+      * There is a NSEventType for an event notifying the change of
+      * -[NSEvent modifierFlags], NSEventTypeFlagsChanged but these operations
+      * are performed for any events because a modifier state may change while
+      * the application is inactive (i.e. no events fire) and we don't want to
+      * wait for another modifier state change to detect such a change.
+      *
+      * NSEventModifierFlagCapsLock requires a special treatment. The other flags
+      * are handled in similar manners.
+      *
+      * NSEventModifierFlagCapsLock
+      * ---------------------------
+      *
+      * If CapsLock state is changed, "up" and "down" events will be fired in
+      * sequence, effectively updates CapsLock state on the guest.
+      *
+      * The other flags
+      * ---------------
+      *
+      * If a flag is not set, fire "up" events for all keys which correspond to
+      * the flag. Note that "down" events are not fired here because the flags
+      * checked here do not tell what exact keys are down.
+      *
+      * If one of the keys corresponding to a flag is down, we rely on
+      * -[NSEvent keyCode] of an event whose -[NSEvent type] is
+      * NSEventTypeFlagsChanged to know the exact key which is down, which has
+      * the following two downsides:
+      * - It does not work when the application is inactive as described above.
+      * - It malfactions *after* the modifier state is changed while the
+      *   application is inactive. It is because -[NSEvent keyCode] does not tell
+      *   if the key is up or down, and requires to infer the current state from
+      *   the previous state. It is still possible to fix such a malfanction by
+      *   completely leaving your hands from the keyboard, which hopefully makes
+      *   this implementation usable enough.
+      */
+     if (!!(modifiers & NSEventModifierFlagCapsLock) !=
+         qkbd_state_modifier_get(kbd, QKBD_MOD_CAPSLOCK)) {
+         qkbd_state_key_event(kbd, KEY_CAPSLOCK, true);
+         qkbd_state_key_event(kbd, KEY_CAPSLOCK, false);
+     }
+ 
+     if (!(modifiers & NSEventModifierFlagShift)) {
+         qkbd_state_key_event(kbd, KEY_LEFTSHIFT, false);
+         qkbd_state_key_event(kbd, KEY_RIGHTSHIFT, false);
+     }
+     if (!(modifiers & NSEventModifierFlagControl)) {
+         qkbd_state_key_event(kbd, KEY_LEFTCTRL, false);
+         qkbd_state_key_event(kbd, KEY_RIGHTCTRL, false);
+     }
+     if (!(modifiers & NSEventModifierFlagOption)) {
+         if (swap_opt_cmd) {
+             qkbd_state_key_event(kbd, KEY_LEFTMETA, false);
+             qkbd_state_key_event(kbd, KEY_RIGHTMETA, false);
+         } else {
+             qkbd_state_key_event(kbd, KEY_LEFTALT, false);
+             qkbd_state_key_event(kbd, KEY_RIGHTALT, false);
+         }
+     }
+     if (!(modifiers & NSEventModifierFlagCommand)) {
+         if (swap_opt_cmd) {
+             qkbd_state_key_event(kbd, KEY_LEFTALT, false);
+             qkbd_state_key_event(kbd, KEY_RIGHTALT, false);
+         } else {
+             qkbd_state_key_event(kbd, KEY_LEFTMETA, false);
+             qkbd_state_key_event(kbd, KEY_RIGHTMETA, false);
+         }
+     }
+ 
++    if (cocoa_is_host_shortcut(event)) {
++        return true;
++    }
++
+     if (qemu_console_is_graphic(dcl.con) && [self handleInjectedText:event]) {
+         return true;
+     }
+ 
+     switch ([event type]) {
+         case NSEventTypeFlagsChanged:
+             switch ([event keyCode]) {
+                 case kVK_Shift:
+                     if (!!(modifiers & NSEventModifierFlagShift)) {
+                         [self toggleKey:KEY_LEFTSHIFT];
+                     }
+                     break;
+ 
+                 case kVK_RightShift:
+                     if (!!(modifiers & NSEventModifierFlagShift)) {
+                         [self toggleKey:KEY_RIGHTSHIFT];
+                     }
+                     break;
+ 
+                 case kVK_Control:
+                     if (!!(modifiers & NSEventModifierFlagControl)) {
+                         [self toggleKey:KEY_LEFTCTRL];
+                     }
+                     break;
+ 
+                 case kVK_RightControl:
+                     if (!!(modifiers & NSEventModifierFlagControl)) {
+                         [self toggleKey:KEY_RIGHTCTRL];
+                     }
+                     break;
+ 
+                 case kVK_Option:
+                     if (!!(modifiers & NSEventModifierFlagOption)) {
+                         if (swap_opt_cmd) {
+                             [self toggleKey:KEY_LEFTMETA];
+                         } else {
+                             [self toggleKey:KEY_LEFTALT];
+                         }
+                     }
+                     break;
+ 
+                 case kVK_RightOption:
+                     if (!!(modifiers & NSEventModifierFlagOption)) {
+                         if (swap_opt_cmd) {
+                             [self toggleKey:KEY_RIGHTMETA];
+                         } else {
+                             [self toggleKey:KEY_RIGHTALT];
+                         }
+                     }
+                     break;
+ 
+                 /* Don't pass command key changes to guest unless we captured the keyboard */
+                 case kVK_Command:
+                     if ([self isKeyboardCaptured] &&
+                         !!(modifiers & NSEventModifierFlagCommand) &&
+                         left_command_key_enabled) {
+                         if (swap_opt_cmd) {
+                             [self toggleKey:KEY_LEFTALT];
+                         } else {
+                             [self toggleKey:KEY_LEFTMETA];
+                         }
+                     }
+                     break;
+ 
+                 case kVK_RightCommand:
+                     if ([self isKeyboardCaptured] &&
+                         !!(modifiers & NSEventModifierFlagCommand)) {
+                         if (swap_opt_cmd) {
+                             [self toggleKey:KEY_RIGHTALT];
+                         } else {
+                             [self toggleKey:KEY_RIGHTMETA];
+                         }
+                     }
+                     break;
+             }
+             return true;
+         case NSEventTypeKeyDown:
+             keycode = cocoa_keycode_to_linux([event keyCode]);
+ 
+             // Keep Command chords with the host unless the focused guest
+             // captured the keyboard.
+             if (![self isKeyboardCaptured] &&
+                 ([event modifierFlags] & NSEventModifierFlagCommand)) {
+                 return false;
+             }
+ 
+             // default
+ 
+             // handle control + alt Key Combos (ctrl+alt+[1..9,g] is reserved for QEMU)
+             if (([event modifierFlags] & NSEventModifierFlagControl) && ([event modifierFlags] & NSEventModifierFlagOption)) {
+                 NSString *keychar = [event charactersIgnoringModifiers];
+                 if ([keychar length] == 1) {
+                     char key = [keychar characterAtIndex:0];
+                     switch (key) {
+ 
+                         // enable graphic console
+                         case '1' ... '9':
+                             [self selectConsoleLocked:key - '0' - 1]; /* ascii math */
+                             return true;
+ 
+                         // release the mouse grab
+                         case 'g':
+                             [self ungrabMouse];
+                             return true;
+                     }
+                 }
+             }
+ 
+             if (qemu_console_is_graphic(dcl.con)) {
+                 qkbd_state_key_event(kbd, keycode, true);
+             } else {
+                 [self handleMonitorInput: event];
+             }
+             return true;
+         case NSEventTypeKeyUp:
+             keycode = cocoa_keycode_to_linux([event keyCode]);
+ 
+             // don't pass the guest a spurious key-up if we treated this
+             // command-key combo as a host UI action
+             if (![self isKeyboardCaptured] &&
+                 ([event modifierFlags] & NSEventModifierFlagCommand)) {
+                 return true;
+             }
+ 
+             if (qemu_console_is_graphic(dcl.con)) {
+                 qkbd_state_key_event(kbd, keycode, false);
+             }
+             return true;
+         case NSEventTypeMagnify:

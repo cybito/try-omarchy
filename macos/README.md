@@ -236,6 +236,17 @@ servicing; they do not remove blocking graphics work or guarantee uninterrupted
 playback under every load. See [audio validation](../docs/audio-continuity.md)
 for the reproduction procedure, observations, and latency limitations.
 
+### custom 分支：宿主快捷键
+
+[GitHub fork 的 `custom` 分支](https://github.com/cybito/try-omarchy/tree/custom)
+是权威版本；本地 checkout 只是副本。当前基于官方 release `v0.5.1` 重建。
+唯一功能差异：`Cmd+Tab`（包括 `Shift+Cmd+Tab`）和精确的 `Ctrl+反引号`
+交给 macOS，其他快捷键保持上游行为。
+
+补丁复用 QEMU Cocoa 现有 HID tap，透传原始事件，并保持按下、重复、释放的
+归属一致；修饰键释放同时更新 guest 状态。不新增 Swift 输入桥或事件重注入，
+不保留旧 custom 的 libslirp 构建改动。使用上游原有的输入权限流程。
+
 ### Remote keyboard text injection
 
 Cocoa translates directly representable printable ASCII text supplied with a
