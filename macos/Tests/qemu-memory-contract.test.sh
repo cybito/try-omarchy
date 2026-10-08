@@ -23,6 +23,15 @@ assert_line_pair() {
     "$file" || fail "expected adjacent lines [$first] and [$second] in $file"
 }
 
+assert_keyboard_lockstep() {
+  local log=$1
+  local geometry=$2
+  [[ $(grep -o "tryomarchy.keyboard=$geometry" "$log" | wc -l | tr -d ' ') == 1 ]] || \
+    fail "expected exactly one tryomarchy.keyboard=$geometry token in $log"
+  [[ $(grep -c "^TRYOMARCHY_KEYBOARD=$geometry$" "$log") == 1 ]] || \
+    fail "Cocoa env must match cmdline token $geometry in $log"
+}
+
 test_root=$(mktemp -d '/private/tmp/omarchy-qemu-memory-contract.XXXXXX')
 case "$test_root" in
   /private/tmp/omarchy-qemu-memory-contract.??????) ;;
@@ -41,19 +50,62 @@ mkdir -p \
   "$resources/scripts" \
   "$shim_dir"
 
-/bin/cp "$macos_dir/run-qemu-gpu.sh" "$resources/scripts/run-qemu-gpu.sh"
+# The copied launcher must never reap another app's live run directories.
+# Keep the unique prefix directly in /private/tmp for short Unix socket paths.
+sed "s|/private/tmp/omarchy-qemu-gpu\\.|/private/tmp/${test_root##*/}-run.|g" \
+  "$macos_dir/run-qemu-gpu.sh" >"$resources/scripts/run-qemu-gpu.sh"
+if grep -Fq '/private/tmp/omarchy-qemu-gpu.' "$resources/scripts/run-qemu-gpu.sh"; then
+  fail "test launcher still refers to production run directories"
+fi
 /bin/cp "$macos_dir/qemu-port-forwarding.sh" "$resources/scripts/qemu-port-forwarding.sh"
 /bin/cp "$macos_dir/qemu-networking.sh" "$resources/scripts/qemu-networking.sh"
 chmod 755 "$resources/scripts/run-qemu-gpu.sh"
 chmod 644 "$resources/scripts/qemu-port-forwarding.sh"
 
+mkdir -p "$resources/guest-settings"
+cp "$macos_dir/guest-settings.service" "$resources/guest-settings/guest-settings.service"
+cp "$macos_dir/../guest/native-overlay/usr/local/bin/omarchy-native-mac-share" "$resources/guest-settings/omarchy-native-mac-share"
+cp "$macos_dir/../guest/scripts/install-settings-integration.py" "$resources/guest-settings/install.py"
+
 cat >"$contents/MacOS/omarchy-vm-helper" <<'SH'
 #!/bin/bash
 set -euo pipefail
+if [[ ${1:-} == --wait-for-qmp ]]; then
+  if [[ -n ${REAL_QMP_HELPER:-} ]]; then
+    exec "$REAL_QMP_HELPER" "$@"
+  fi
+  exit "${FAKE_QMP_READY_STATUS:-0}"
+fi
+if [[ ${1:-} == --host-keyboard-geometry ]]; then
+  if [[ -n ${FAKE_HOST_KEYBOARD_FAIL:-} ]]; then
+    printf 'cannot detect host keyboard geometry\n' >&2
+    exit 1
+  fi
+  printf '%s\n' "${FAKE_HOST_KEYBOARD:-iso}"
+  exit 0
+fi
+if [[ ${1:-} == --host-audio-frequency ]]; then
+  [[ $# == 3 ]] || exit 2
+  [[ ${FAKE_HOST_AUDIO_FAIL:-} != "$2" ]] || exit 1
+  case "$2:$3" in
+    'output:External Speaker') printf '48000\n' ;;
+    'output:Display Audio (2)') printf '88200\n' ;;
+    'input:USB Microphone') printf '16000\n' ;;
+    output:*) printf '%s\n' "${FAKE_HOST_OUTPUT_RATE:-44100}" ;;
+    input:*) printf '%s\n' "${FAKE_HOST_INPUT_RATE:-48000}" ;;
+    *) exit 2 ;;
+  esac
+  exit 0
+fi
+if [[ ${1:-} == --host-timezone ]]; then
+  printf '%s\n' Asia/Tokyo
+  exit 0
+fi
 if [[ ${1:-} == --bridge-native-audio \
    || ${1:-} == --bridge-native-authentication \
    || ${1:-} == --bridge-native-clipboard \
-   || ${1:-} == --bridge-native-camera ]]; then
+   || ${1:-} == --bridge-native-camera \
+   || ${1:-} == --bridge-native-timezone ]]; then
   while kill -0 "$2" 2>/dev/null; do
     sleep 0.02
   done
@@ -71,6 +123,7 @@ cat >"$resources/runtime/bin/Try Omarchy" <<'SH'
 # OMARCHY_SDL_OUTPUT_DEVICE_NAME
 # guest_owner_uid guest_owner_gid
 # hv_vm_config_set_el2_enabled hv_gic_create
+# HVF free-page backing replacement failed
 case " $* " in
   *' -accel help '*) printf '%s\n' hvf ;;
   *' -machine help '*) printf '%s\n' 'virt                 ARM Virtual Machine' ;;
@@ -100,14 +153,24 @@ case " $* " in
     ;;
   *)
     exec /usr/bin/python3 - "$@" <<'PY'
+import json
 import os
 from pathlib import Path
 import socket
 import sys
+import threading
 import time
 
 arguments = sys.argv[1:]
-Path(os.environ["FAKE_QEMU_LOG"]).write_text("\n".join(arguments) + "\n")
+geometry = os.environ.get("TRYOMARCHY_KEYBOARD", "")
+Path(os.environ["FAKE_QEMU_LOG"]).write_text(
+    "\n".join(arguments) + f"\nTRYOMARCHY_KEYBOARD={geometry}\n"
+)
+qmp_paths = {
+    arguments[index + 1][5:].split(",", 1)[0]
+    for index, argument in enumerate(arguments[:-1])
+    if argument == "-qmp" and arguments[index + 1].startswith("unix:")
+}
 socket_paths = []
 for argument in arguments:
     if argument.startswith("unix:"):
@@ -128,6 +191,26 @@ if os.environ.get("FAKE_QEMU_SKIP_SOCKETS") != "1":
         server.bind(path)
         server.listen(1)
         servers.append(server)
+        # Like QEMU, answer the QMP monitor with a greeting; the launcher
+        # waits for that before declaring the VM ready.
+        if path in qmp_paths:
+            def greet(server=server):
+                while True:
+                    try:
+                        client, _ = server.accept()
+                    except OSError:
+                        return
+                    try:
+                        client.settimeout(1)
+                        client.sendall(b'{"QMP": {"version": {}, "capabilities": []}}\r\n')
+                        with client.makefile("rb") as stream:
+                            request = json.loads(stream.readline())
+                        assert request["execute"] == "qmp_capabilities"
+                        client.sendall(json.dumps({"return": {}, "id": request["id"]}).encode() + b"\r\n")
+                    except (OSError, ValueError):
+                        pass
+                    client.close()
+            threading.Thread(target=greet, daemon=True).start()
 
 time.sleep(float(os.environ.get("FAKE_QEMU_LIFETIME", "0.20")))
 for server in servers:
@@ -158,9 +241,13 @@ _qps_permissions() { /usr/bin/stat -f '%Lp' "$1"; }
 _qps_lstat_kind() { /usr/bin/stat -f '%HT' "$1"; }
 _qps_size() { /usr/bin/stat -f '%z' "$1"; }
 qemu_persistent_storage_release_lock() { :; }
-qemu_persistent_storage_materialize_source() {
-  printf 'materialize\n' >>"$FAKE_STORAGE_LOG"
-  return 1
+qemu_persistent_storage_reset() {
+  printf 'clear\n' >>"$FAKE_STORAGE_LOG"
+  /bin/rm -f "$FAKE_PERSISTENT_ROOT/rootfs.ext4"
+  /bin/rm -rf "$FAKE_PERSISTENT_ROOT/boot"
+}
+qemu_persistent_storage_grow_selected() {
+  printf 'grow:%s\n' "$1" >>"$FAKE_STORAGE_LOG"
 }
 qemu_persistent_storage_select_existing() {
   printf 'select-existing\n' >>"$FAKE_STORAGE_LOG"
@@ -311,10 +398,35 @@ run_scenario() {
   fi
 }
 
+# Disk settings reach the locked storage path; malformed values never touch it.
+run_scenario disk-default 0
+[[ $(cat "$test_root/disk-default/storage.log") != *grow:* ]] || fail 'default launch grew disk'
+run_scenario disk-maximum 0 OMARCHY_QEMU_GPU_DISK_GIB=64
+assert_contains "$(cat "$test_root/disk-maximum/storage.log")" 'grow:68719476736'
+for value in 0 01 8193 1.5 -1 invalid 99999999999999999; do
+  run_scenario "disk-invalid-$value" 1 OMARCHY_QEMU_GPU_DISK_GIB="$value"
+  [[ ! -e "$test_root/disk-invalid-$value/storage.log" ]] || fail 'invalid disk size touched storage'
+done
+
 # A 16 GiB Mac defaults to 8 GiB; smaller Macs keep the 4 GiB baseline.
 run_scenario default 0
 assert_line_pair "$test_root/default/qemu.log" -m 8192M
+assert_line_pair "$test_root/default/qemu.log" -audiodev sdl,id=omarchy-audio,timer-period=1000,out.buffer-count=8,out.frequency=44100,in.frequency=48000
+assert_line_pair "$test_root/default/qemu.log" -device virtio-balloon-pci,free-page-reporting=on
 assert_contains "$(<"$test_root/default/stderr")" '8 GiB RAM'
+assert_keyboard_lockstep "$test_root/default/qemu.log" iso
+
+# Saved routes and direction-specific rates reach the native query and QEMU.
+run_scenario selected-audio 0 \
+  OMARCHY_SDL_OUTPUT_DEVICE_NAME='External Speaker' \
+  OMARCHY_SDL_INPUT_DEVICE_NAME='USB Microphone'
+assert_line_pair "$test_root/selected-audio/qemu.log" -audiodev sdl,id=omarchy-audio,timer-period=1000,out.buffer-count=8,out.frequency=48000,in.frequency=16000
+run_scenario duplicate-audio 0 OMARCHY_SDL_OUTPUT_DEVICE_NAME='Display Audio (2)'
+assert_line_pair "$test_root/duplicate-audio/qemu.log" -audiodev sdl,id=omarchy-audio,timer-period=1000,out.buffer-count=8,out.frequency=88200,in.frequency=48000
+run_scenario audio-query-failure 0 FAKE_HOST_AUDIO_FAIL=output FAKE_HOST_INPUT_RATE=32000
+assert_line_pair "$test_root/audio-query-failure/qemu.log" -audiodev sdl,id=omarchy-audio,timer-period=1000,out.buffer-count=8,out.frequency=48000,in.frequency=32000
+run_scenario audio-invalid-rate 0 FAKE_HOST_INPUT_RATE='48000,out.frequency=99999'
+assert_line_pair "$test_root/audio-invalid-rate/qemu.log" -audiodev sdl,id=omarchy-audio,timer-period=1000,out.buffer-count=8,out.frequency=44100,in.frequency=48000
 
 run_scenario below-default-threshold 0 FAKE_HOST_MEMSIZE=17178820608
 assert_line_pair "$test_root/below-default-threshold/qemu.log" -m 4096M
@@ -328,6 +440,7 @@ run_scenario twelve-gib 0 OMARCHY_QEMU_GPU_MEMORY_MIB=12288
 assert_line_pair "$test_root/twelve-gib/qemu.log" -m 12288M
 run_scenario large-host-maximum 0 FAKE_HOST_MEMSIZE=51539607552 OMARCHY_QEMU_GPU_MEMORY_MIB=45056
 assert_line_pair "$test_root/large-host-maximum/qemu.log" -m 45056M
+assert_line_pair "$test_root/large-host-maximum/qemu.log" -device virtio-balloon-pci,free-page-reporting=on
 run_scenario above-host-maximum 1 OMARCHY_QEMU_GPU_MEMORY_MIB=12289
 assert_contains "$(<"$test_root/above-host-maximum/stderr")" 'leave the host at least 4096 MiB'
 
@@ -370,5 +483,10 @@ assert_contains "$(<"$test_root/starved-host/stderr")" 'leave the host at least 
 # if the host cap is ever applied to the default.
 run_scenario small-host-default 0 FAKE_HOST_MEMSIZE=7516192768
 assert_line_pair "$test_root/small-host-default/qemu.log" -m 4096M
+
+# An older runtime must not silently claim to reclaim memory on macOS.
+sed -i '' '/^# HVF free-page backing replacement failed$/d' "$resources/runtime/bin/Try Omarchy"
+run_scenario old-runtime 1
+assert_contains "$(<"$test_root/old-runtime/stderr")" 'lacks macOS memory reclamation'
 
 printf 'qemu-memory-contract.test: PASS\n'

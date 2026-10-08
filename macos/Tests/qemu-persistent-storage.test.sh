@@ -6,10 +6,23 @@ test_dir=$(cd "$(dirname "$0")" && pwd -P)
 native_dir=$(cd "$test_dir/.." && pwd -P)
 # shellcheck source=../qemu-persistent-storage.sh
 source "$native_dir/qemu-persistent-storage.sh"
+QEMU_PERSISTENT_STORAGE_HELPER="$native_dir/.build/debug/omarchy-vm-helper"
+[[ -x $QEMU_PERSISTENT_STORAGE_HELPER ]] || {
+  printf 'Build the native helper with swift build --package-path macos before running storage tests.\n' >&2
+  exit 1
+}
 
 grep -Fq '/bin/rm -rf -x "$qps_discarded"' \
   "$native_dir/qemu-persistent-storage.sh" || {
     printf 'qemu-persistent-storage.test: structural boot reset may cross a nested mount\n' >&2
+    exit 1
+  }
+
+# Development app launches must share the stable single-disk policy, even if
+# the shell environment previously enabled identity-keyed test workspaces.
+grep -Fxq '  --env OMARCHY_QEMU_GPU_DEVELOPMENT_MULTI_DISK=0 \' \
+  "$native_dir/open-qemu-gpu.sh" || {
+    printf 'qemu-persistent-storage.test: development app must use one workspace\n' >&2
     exit 1
   }
 
@@ -168,6 +181,11 @@ identity_bad=$(printf 'bundle-bad' | shasum -a 256 | awk '{print $1}')
 identity_expanded=$(printf 'bundle-expanded' | shasum -a 256 | awk '{print $1}')
 identity_compressed=$(printf 'bundle-compressed' | shasum -a 256 | awk '{print $1}')
 
+# Both the native fast path and standalone fallback retain byte-exact SHA-256.
+assert_eq "$(_qps_sha256 "$source_disk")" "$source_sha"
+assert_eq "$(_qps_sha256_line 'bundle-a')" "$(printf 'bundle-a\n' | shasum -a 256 | awk '{print $1}')"
+assert_eq "$(QEMU_PERSISTENT_STORAGE_HELPER=''; _qps_sha256 "$source_disk")" "$source_sha"
+
 # Direct-kernel boots must stay paired with the userspace on each saved disk.
 # These tiny fixtures carry the two file signatures enforced by the storage
 # library while remaining visibly different across bundle generations.
@@ -189,6 +207,42 @@ printf '\x28\xb5\x2f\xfdzstd-initramfs\n' >"$initramfs_zstd"
 printf '\x28\xb5\x2f\xfd' >"$initramfs_zstd_truncated"
 kernel_command_line_a='root=/dev/vda rw rootwait console=tty0 console=hvc0 loglevel=4'
 kernel_command_line_b='root=/dev/vda rw rootwait console=tty0 console=hvc0 loglevel=5'
+
+# A failed durability checkpoint must never publish a partially prepared disk
+# or boot kit. Retrying reaps the recognized staging transaction and succeeds.
+(
+  export OMARCHY_QEMU_GPU_STATE_ROOT="$test_root/checkpoint-failure"
+  export OMARCHY_QEMU_GPU_DEVELOPMENT_MULTI_DISK=0
+  _qps_prepare_state_root
+  (
+    _qps_fsync() {
+      local checkpoint
+      for checkpoint in "$@"; do
+        if [[ -d $checkpoint && $checkpoint == */.*.initializing.* ]]; then
+          return 1
+        fi
+      done
+      "$QEMU_PERSISTENT_STORAGE_HELPER" --storage-sync "$@"
+    }
+    assert_fails _qps_initialize_persistent_disk \
+      "$identity_a" current "$source_disk" "$source_sha" "$source_bytes" "$source_bytes"
+    assert test ! -e "$QEMU_PERSISTENT_STORAGE_DISKS_ROOT/current"
+    assert_fails _qps_stage_boot_kit_locked \
+      "$identity_a" "$kernel_a" "$initramfs_a" "$kernel_command_line_a"
+    assert test ! -e "$QEMU_PERSISTENT_STORAGE_BOOT_ROOT/$identity_a"
+  )
+  qemu_persistent_storage_select reset "$identity_a" "$source_disk" "$source_sha" "$source_bytes" '' \
+    "$source_bytes" "$kernel_a" "$initramfs_a" "$kernel_command_line_a"
+  assert cmp -s "$QEMU_SELECTED_DISK" "$source_disk"
+  assert cmp -s "$QEMU_SELECTED_KERNEL" "$kernel_a"
+  qemu_persistent_storage_release_lock
+)
+assert _qps_validate_kernel_command_line "$kernel_command_line_a"
+assert_fails _qps_validate_kernel_command_line \
+  "$kernel_command_line_a omarchy.virgl_dual_source=1"
+assert_fails _qps_validate_kernel_command_line \
+  "$kernel_command_line_a omarchy.virgl_dual_source=0"
+
 
 # Inspecting a new location reports "missing" without asking for, copying, or
 # materializing a factory disk. A full selection then creates the VM and pairs
@@ -222,8 +276,8 @@ assert_fails _qps_assert_boot_source_file \
 export OMARCHY_QEMU_GPU_STATE_ROOT="$test_root/state"
 export OMARCHY_QEMU_GPU_DEVELOPMENT_MULTI_DISK=1
 
-# A compressed app payload is expanded once into the private immutable-image
-# cache, verified against the raw manifest digest, and reused thereafter.
+# Compressed factories are expanded straight into the selected writable disk.
+# Reset re-expands and verifies the payload without retaining an image cache.
 compressed_disk="$test_root/source.ext4.zst"
 zstd_test="$test_root/zstd"
 cp "$source_disk" "$compressed_disk"
@@ -235,15 +289,88 @@ set -euo pipefail
 EOF
 chmod 700 "$zstd_test"
 compressed_bytes=$(/usr/bin/stat -f '%z' "$compressed_disk")
-qemu_persistent_storage_materialize_source \
-  "$identity_compressed" "$compressed_disk" "$compressed_bytes" \
-  "$source_sha" "$source_bytes" "$zstd_test"
-materialized_source=$QEMU_IMMUTABLE_SOURCE_DISK
-assert cmp -s "$materialized_source" "$source_disk"
-qemu_persistent_storage_materialize_source \
-  "$identity_compressed" "$compressed_disk" "$compressed_bytes" \
-  "$source_sha" "$source_bytes" "$zstd_test"
-assert_eq "$QEMU_IMMUTABLE_SOURCE_DISK" "$materialized_source"
+compressed_state="$test_root/compressed-state"
+(
+  export OMARCHY_QEMU_GPU_STATE_ROOT="$compressed_state"
+  export OMARCHY_QEMU_GPU_DEVELOPMENT_MULTI_DISK=0
+  for mode in persistent reset reset; do
+    qemu_persistent_storage_select \
+      "$mode" "$identity_compressed" "$compressed_disk" "$source_sha" "$source_bytes" '' \
+      "$source_bytes" "$kernel_a" "$initramfs_a" "$kernel_command_line_a" "$zstd_test" \
+      2>"$test_root/reset-phases.log"
+    sed -n -e 's/^\[qemu-gpu\] Reset phase: /reset:/p' \
+      -e 's/^\[qemu-gpu\] Launch phase: /launch:/p' \
+      "$test_root/reset-phases.log" >"$test_root/actual-phases"
+    if [[ $mode == reset ]]; then
+      printf '%s\n' reset:deleting launch:preparing launch:verifying launch:finishing >"$test_root/expected-phases"
+      assert cmp -s "$test_root/actual-phases" "$test_root/expected-phases"
+    else
+      printf '%s\n' launch:preparing launch:verifying launch:finishing >"$test_root/expected-phases"
+      assert cmp -s "$test_root/actual-phases" "$test_root/expected-phases"
+    fi
+    assert cmp -s "$QEMU_SELECTED_DISK" "$source_disk"
+    assert test ! -e "$compressed_state/images"
+    assert_eq "$(find "$compressed_state/disks" -name rootfs.ext4 | wc -l | tr -d '[:space:]')" 1
+    qemu_persistent_storage_release_lock
+  done
+  # A bad expanded digest must never publish a disk, even when reset is requested.
+  assert_fails qemu_persistent_storage_select \
+    reset "$identity_compressed" "$compressed_disk" "$source_sha_b" "$source_bytes" '' \
+    "$source_bytes" "$kernel_a" "$initramfs_a" "$kernel_command_line_a" "$zstd_test"
+  assert test ! -e "$compressed_state/disks/current"
+  qemu_persistent_storage_release_lock
+  ephemeral_compressed="$test_root/ephemeral-compressed"
+  mkdir -m 700 "$ephemeral_compressed"
+  qemu_persistent_storage_select \
+    ephemeral "$identity_compressed" "$compressed_disk" "$source_sha" "$source_bytes" \
+    "$ephemeral_compressed" "$source_bytes" '' '' '' "$zstd_test"
+  assert cmp -s "$QEMU_SELECTED_DISK" "$source_disk"
+)
+
+# UI reset clears the VM without a factory source or free-space headroom,
+# releases the lock, and leaves creation to the next normal launch.
+(
+  export OMARCHY_QEMU_GPU_STATE_ROOT="$test_root/clear-only-state"
+  export OMARCHY_QEMU_GPU_DEVELOPMENT_MULTI_DISK=0
+  qemu_persistent_storage_select \
+    persistent "$identity_a" "$source_disk" "$source_sha" "$source_bytes" '' \
+    "$source_bytes" "$kernel_a" "$initramfs_a" "$kernel_command_line_a"
+  assert_fails /bin/bash -c \
+    'source "$1"; qemu_persistent_storage_reset "$2"' \
+    qps-reset-lock-test "$native_dir/qemu-persistent-storage.sh" "$identity_a" 9>&-
+  assert test -f "$QEMU_SELECTED_DISK"
+  qemu_persistent_storage_release_lock
+  export OMARCHY_QEMU_GPU_DEVELOPMENT_MULTI_DISK=1
+  qemu_persistent_storage_select \
+    persistent "$identity_b" "$source_disk_b" "$source_sha_b" "$source_bytes_b" '' \
+    "$source_bytes_b" "$kernel_b" "$initramfs_b" "$kernel_command_line_b"
+  qemu_persistent_storage_release_lock
+  export OMARCHY_QEMU_GPU_DEVELOPMENT_MULTI_DISK=0
+  printf 'keep me\n' >"$OMARCHY_QEMU_GPU_STATE_ROOT/notes.txt"
+  export OMARCHY_QEMU_GPU_TEST_FREE_BYTES=0
+  qemu_persistent_storage_reset "$identity_b" 2>"$test_root/clear-phases.log"
+  assert test ! -e "$OMARCHY_QEMU_GPU_STATE_ROOT/disks/current"
+  assert test ! -e "$OMARCHY_QEMU_GPU_STATE_ROOT/disks/$identity_b"
+  assert test ! -e "$OMARCHY_QEMU_GPU_STATE_ROOT/boot/$identity_a"
+  assert test ! -e "$OMARCHY_QEMU_GPU_STATE_ROOT/boot/$identity_b"
+  assert test -f "$OMARCHY_QEMU_GPU_STATE_ROOT/notes.txt"
+  assert_fails _qps_lock_fd_is_open
+  sed -n 's/^\[qemu-gpu\] Reset phase: //p' "$test_root/clear-phases.log" >"$test_root/actual-phases"
+  printf '%s\n' deleting finishing >"$test_root/expected-phases"
+  assert cmp -s "$test_root/actual-phases" "$test_root/expected-phases"
+  assert_status "$QEMU_PERSISTENT_STORAGE_MISSING_STATUS" \
+    qemu_persistent_storage_select_existing "$identity_b" "$kernel_b" "$initramfs_b" "$kernel_command_line_b"
+  unset OMARCHY_QEMU_GPU_TEST_FREE_BYTES
+  qemu_persistent_storage_select \
+    persistent "$identity_b" "$compressed_disk" "$source_sha" "$source_bytes" '' \
+    "$source_bytes" "$kernel_b" "$initramfs_b" "$kernel_command_line_b" "$zstd_test" \
+    2>"$test_root/launch-phases.log"
+  assert cmp -s "$QEMU_SELECTED_DISK" "$source_disk"
+  qemu_persistent_storage_release_lock
+  sed -n 's/^\[qemu-gpu\] Launch phase: //p' "$test_root/launch-phases.log" >"$test_root/actual-phases"
+  printf '%s\n' preparing verifying finishing >"$test_root/expected-phases"
+  assert cmp -s "$test_root/actual-phases" "$test_root/expected-phases"
+)
 
 # The factory workspace grows sparsely while its immutable source stays at the
 # transport size. Relaunch validates and reuses the expanded workspace.
@@ -803,9 +930,9 @@ export OMARCHY_QEMU_GPU_STATE_ROOT=$unsupported_root
 export OMARCHY_QEMU_GPU_TEST_FS_TYPE=exfat
 assert_fails qemu_persistent_storage_select \
   persistent "$identity_a" "$source_disk" "$source_sha" "$source_bytes" ''
-assert_fails qemu_persistent_storage_materialize_source \
-  "$identity_compressed" "$compressed_disk" "$compressed_bytes" \
-  "$source_sha" "$source_bytes" "$zstd_test"
+assert_fails qemu_persistent_storage_select \
+  persistent "$identity_compressed" "$compressed_disk" "$source_sha" "$source_bytes" '' \
+  "$source_bytes" '' '' '' "$zstd_test"
 unset OMARCHY_QEMU_GPU_TEST_FS_TYPE
 assert test ! -e "$unsupported_root/disks"
 assert test ! -e "$unsupported_root/images"
@@ -816,14 +943,14 @@ export OMARCHY_QEMU_GPU_STATE_ROOT=$saved_state_root
 cramped_root="$test_root/cramped-state"
 export OMARCHY_QEMU_GPU_STATE_ROOT=$cramped_root
 export OMARCHY_QEMU_GPU_TEST_FREE_BYTES=1024
-assert_fails qemu_persistent_storage_materialize_source \
-  "$identity_compressed" "$compressed_disk" "$compressed_bytes" \
-  "$source_sha" "$source_bytes" "$zstd_test"
+assert_fails qemu_persistent_storage_select \
+  persistent "$identity_compressed" "$compressed_disk" "$source_sha" "$source_bytes" '' \
+  "$source_bytes" '' '' '' "$zstd_test"
 assert_fails qemu_persistent_storage_select \
   persistent "$identity_a" "$source_disk" "$source_sha" "$source_bytes" ''
 unset OMARCHY_QEMU_GPU_TEST_FREE_BYTES
 assert test ! -e "$cramped_root/disks/current"
-assert_eq "$(find "$cramped_root/images" -type f | wc -l | tr -d '[:space:]')" 0
+assert test ! -e "$cramped_root/images"
 export OMARCHY_QEMU_GPU_STATE_ROOT=$saved_state_root
 
 # The same volume succeeds once the room is there, proving the guard is what
@@ -890,5 +1017,15 @@ saved_marker_state_root=$OMARCHY_QEMU_GPU_STATE_ROOT
 export OMARCHY_QEMU_GPU_STATE_ROOT=$marker_root
 assert_fails _qps_prepare_state_root
 export OMARCHY_QEMU_GPU_STATE_ROOT=$saved_marker_state_root
+
+# Launch-time keyboard and SSH tokens must not be persisted or recovered.
+valid_command_line='root=/dev/vda rw rootwait console=tty0 console=hvc0 loglevel=4'
+assert _qps_validate_kernel_command_line "$valid_command_line"
+assert_fails _qps_validate_kernel_command_line \
+  "$valid_command_line tryomarchy.keyboard=iso"
+assert_fails _qps_validate_kernel_command_line \
+  "$valid_command_line tryomarchy.ssh_access=1"
+assert_fails _qps_validate_kernel_command_line \
+  "$valid_command_line tryomarchy.export_boot=1"
 
 printf 'qemu-persistent-storage.test: PASS\n'

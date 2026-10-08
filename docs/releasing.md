@@ -7,9 +7,58 @@ Releases are Apple Silicon-only and require macOS 15 or newer.
 ```sh
 make doctor
 make test
-make build
 make release
 ```
+
+`make release` lets you choose **patch**, **minor**, or **major**, or type a
+version directly in the terminal. Each increment shows its resulting `vX.Y.Z`
+tag, calculated from the latest local release tag (or `v0.0.0` when no release
+tags exist). There is no default increment: Enter asks you to select a version.
+You can also type a custom tag directly. Before building or creating a tag, an
+interactive run shows the exact release tag and commit and asks for confirmation
+with **No** as the default. Only `y` or `yes` proceeds, including when rebuilding
+an existing tag. To choose the version explicitly, including in scripts, use:
+
+```sh
+make release VERSION=vX.Y.Z
+```
+
+All created tags use `vX.Y.Z`. Custom input and `VERSION` accept `vX.Y.Z` or
+`X.Y.Z`, which is normalized to the same tag format. Without an interactive
+terminal, `VERSION` is required. The checkout must be clean, including untracked
+files; ignored build output does not make it dirty. New versions must be newer
+than the local release tags. Fetch any missing tags before choosing a version;
+this command does not check GitHub for published versions.
+
+Noninteractive runs with `VERSION` skip confirmation; supplying the version is
+the explicit instruction to build that release.
+
+The command builds guest and runtime artifacts only when needed, rechecks the
+checkout, creates an annotated `vX.Y.Z` tag on the commit being packaged, and
+builds the signed and notarized app and DMG. The tag must exist before packaging
+so the app and DMG receive the correct version. Tests and the runtime release
+checklist below remain separate verification steps.
+
+If packaging or notarization fails, the local tag remains. Retry with
+`make release VERSION=vX.Y.Z`; an existing tag is reused only when it points to
+HEAD, and is never moved. The terminal prompt defaults to that existing version
+when HEAD is already tagged. A commit with a release tag cannot be given a
+second release version through this command, which keeps app version stamping
+unambiguous.
+
+`make package` remains available for an already-tagged clean checkout. It
+neither prompts nor creates a tag.
+
+After verifying the DMG, push the tag with `git push origin vX.Y.Z`, then create
+the GitHub release manually using that existing tag and attach
+`dist/TryOmarchy.dmg`. The filename stays the same for every release; the app
+inside is stamped with the version from the release tag. `make release` creates
+the local tag; pushing it, creating the GitHub release, and uploading the DMG
+remain manual.
+
+Always upload the DMG as `TryOmarchy.dmg` so older app release checkers and the
+website's stable download link continue to work:
+<https://github.com/omacom/try-omarchy/releases/latest/download/TryOmarchy.dmg>.
 
 When the release updates Omarchy itself, first run:
 
@@ -22,7 +71,7 @@ before continuing with the normal build and verification sequence.
 
 Outputs are written to:
 
-- `dist/app.noindex/Try Omarchy.app`
+- `dist/release.noindex/Try Omarchy.app` (production)
 - `dist/TryOmarchy.dmg`
 - `dist/guest/`
 
@@ -31,10 +80,12 @@ the app and DMG with Developer ID, submit the DMG to Apple's notarization
 service, and staple the resulting tickets. Neither command falls back to an
 unnotarized build. Both commands first ensure the content-hashed guest and
 runtime artifacts are current; packaging and signing themselves always run
-freshly. Another maintainer can override the release defaults:
+freshly. Development stays at `dist/app.noindex/Try Omarchy.app` with a separate
+bundle ID and privacy grants, so production permission flows can be tested
+independently. Another maintainer can override the release defaults:
 
 ```sh
-make release \
+make release VERSION=vX.Y.Z \
   RELEASE_SIGN_IDENTITY="Developer ID Application: Example (TEAMID)" \
   RELEASE_NOTARY_PROFILE=example-profile
 ```
@@ -82,3 +133,17 @@ input.
 The saved boot-kit ABI is a compatibility boundary. Do not change it or remove
 support for an existing value without a reviewed preserving migration or an
 explicitly confirmed reset path.
+
+## macOS compatibility validation
+
+Run `make test` and `make runtime` on macOS 15 and 26 (both covered by CI).
+The runtime build runs the pinned VirGL dual-source shader
+and blend-state regression tests and rejects bundled Mach-O files targeting a
+version newer than 15.0 or strongly importing `strchrnul` (introduced in 15.4).
+These binary checks do not replace testing on the supported operating systems.
+
+Before publishing, boot the release app on macOS 15.0–15.3 and macOS 26. Verify
+Alacritty uses accelerated rendering and correctly draws text while resizing,
+check desktop rendering, and test both new and existing guests. macOS 15 must
+use EL1 without probing nested virtualization; on macOS 26, verify the existing
+EL2 probe and fallback on supported and unsupported hardware respectively.

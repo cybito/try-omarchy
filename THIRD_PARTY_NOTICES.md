@@ -11,20 +11,13 @@ code.
   build.
 - **Arch Linux ARM packages** — each package retains its own license. The
   generated package transaction is recorded in `packages.lock.txt`.
-- **Hyprland** — BSD-3-Clause; the reviewed v0.56.1 source and rounded-border
+- **Hyprland** — BSD-3-Clause; the reviewed v0.56.2 source and rounded-border
   coverage backport are pinned in `guest/spec.json`. The guest package retains
   Hyprland's upstream license and dependency metadata.
-- **aquamarine** — BSD-3-Clause; Arch Linux ARM currently publishes only
-  `libaquamarine.so=14`, while the pinned Hyprland still requires `.so=13`. The
-  factory therefore rebuilds `aquamarine 0.14.0-2` from the reviewed Arch
-  PKGBUILD and `hyprwm/aquamarine` v0.14.0 tarball (pinned in `guest/spec.json`)
-  for factory builds. The finished guest holds aquamarine and Hyprtoolkit on
-  `IgnorePkg` with Hyprland so updates cannot mix incompatible ABIs.
-- **Hyprtoolkit** — BSD-3-Clause; the factory rebuilds the reviewed
-  `hyprwm/hyprtoolkit` v0.5.4 source using the Arch 0.5.4-6 recipe adapted for
-  aarch64 and package release 6.1, linked against aquamarine 0.14. Source,
-  recipe, packaging commit, and library hashes are pinned in `guest/spec.json`;
-  the package retains its upstream license.
+- **Aquamarine, Hyprtoolkit, and hyprland-guiutils** — BSD-3-Clause; signed
+  Arch Linux ARM packages pinned in `guest/packages.lock.json`. The factory
+  retains their upstream licenses and holds the compatible set alongside
+  the patched Hyprland on `IgnorePkg`.
 - **Glaze** — MIT; the pinned v7.2.0 headers are used by the Hyprland build, and
   their verified upstream license is retained in the rebuilt guest package.
 - **ANGLE, VirGLRenderer, libepoxy, SDL, libslirp, GLib, Pixman, and other QEMU
@@ -41,6 +34,13 @@ code.
   release key, source archive, and checksums are pinned in `guest/spec.json`.
   They are packaged in the guest's local repository but remain uninstalled
   until the user invokes Omarchy's optional dictation installer.
+- **Ghostty** — MIT; optional user-initiated source build. The installer pins
+  Ghostty 1.3.1, its Minisign signature and verification key, and the MIT-licensed
+  Zig 0.15.2 ARM64 compiler. Ghostty and its bundled dependencies retain their
+  upstream licenses; the source archives include the corresponding notices.
+  The guest factory image contains only the installer and recipe, not Ghostty
+  or the downloaded compiler. These post-build downloads are declared in
+  `guest/spec.json` and excluded from factory artifact provenance.
 - **1Password** — proprietary software not redistributed by Try Omarchy. When a
   user explicitly invokes its optional ARM64 installer, the guest resolves the
   current vendor release and AUR CLI recipe after the factory build. These

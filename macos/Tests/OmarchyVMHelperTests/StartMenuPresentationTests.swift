@@ -269,4 +269,5 @@ struct StartMenuPresentationTests {
         #expect(StartMenuPresentation.immersiveDetail(isEnabled: false)
             == "Omarchy opens in a window with the Mac menu bar and Dock available.")
     }
+
 }

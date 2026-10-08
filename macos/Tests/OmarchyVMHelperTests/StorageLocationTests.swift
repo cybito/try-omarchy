@@ -404,10 +404,6 @@ struct StorageLocationPolicyTests {
             identity: previousIdentity
         )
 
-        #expect(!StorageLocationPolicy.hasMaterializedSource(
-            stateRoot: container.path,
-            identity: metrics.identity
-        ))
         let resolution = try StorageLocationPolicy.validate(
             container.path,
             metrics: metrics,
@@ -436,6 +432,30 @@ struct StorageLocationPolicyTests {
         )
         #expect(resolution.stateRoot == container.path)
         #expect(resolution.spaceWarning == nil)
+    }
+
+    @Test("Legacy disks can review fixes before their first boot and keep consent after migration")
+    func legacyDiskFixConsent() throws {
+        let container = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: container) }
+        try writeValidRootMarker(in: container)
+        let previousIdentity = String(repeating: "b", count: 64)
+        let disk = try writeRecordedPersistentDisk(in: container, directoryName: previousIdentity, identity: previousIdentity)
+        let selected = try #require(QEMUGPUStorageSpaceEstimate.recordedPersistentDiskURL(
+            stateRoot: container.path, bundleIdentity: metrics.identity
+        ))
+        #expect(selected.resolvingSymlinksInPath() == disk.resolvingSymlinksInPath())
+        let cache = try #require(GuestBootFixCache.url(storageRoot: container, diskURL: selected))
+        #expect(GuestBootFixCache.needsReview(cacheURL: cache, expectedIdentity: metrics.identity))
+        let consent = try #require(GuestBootFixCache.consent(cacheURL: cache, identity: metrics.identity))
+        try GuestBootFixCache.recordReview(cacheURL: cache, identity: metrics.identity)
+        try FileManager.default.moveItem(at: disk.deletingLastPathComponent(),
+                                        to: container.appendingPathComponent("disks/current"))
+        let migratedCache = try #require(GuestBootFixCache.url(storageRoot: container))
+        #expect(cache == migratedCache)
+        #expect(GuestBootFixCache.consent(cacheURL: migratedCache, identity: metrics.identity) == consent)
+        #expect(!GuestBootFixCache.needsReview(cacheURL: migratedCache, expectedIdentity: metrics.identity))
+        #expect(GuestBootFixCache.needsReview(cacheURL: migratedCache, expectedIdentity: metrics.identity, manuallyRequested: true))
     }
 
     @Test("a workspace marker without a recorded disk still needs factory-image space")
@@ -507,8 +527,7 @@ struct StorageLocationPolicyTests {
 
         let requirement = StorageSpaceRequirement(
             sourceBytes: sourceBytes,
-            workingBytes: workingBytes,
-            sourceAlreadyPresent: false
+            workingBytes: workingBytes
         )
         let available = (requirement.floorBytes + requirement.comfortBytes) / 2
         let resolution = try StorageLocationPolicy.validate(
@@ -519,8 +538,8 @@ struct StorageLocationPolicyTests {
         #expect(resolution.spaceWarning != nil)
     }
 
-    @Test("an already-materialized factory image is not charged for twice")
-    func materializedSourceLowersTheFloor() throws {
+    @Test("old factory caches do not bypass space needed for a new disk")
+    func legacyFactoryCacheDoesNotLowerTheFloor() throws {
         let container = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: container) }
 
@@ -534,20 +553,19 @@ struct StorageLocationPolicyTests {
             )
         }
 
-        // The marker is always written before `images/` gains content — see
-        // `_qps_prepare_state_root` in qemu-persistent-storage.sh — so a
-        // realistic "already materialized" fixture carries both.
+        // Old versions may have left a cache, but new disks no longer use it.
         try writeValidRootMarker(in: container)
         let images = container.appendingPathComponent("images", isDirectory: true)
         try FileManager.default.createDirectory(at: images, withIntermediateDirectories: true)
         try Data().write(to: images.appendingPathComponent("\(metrics.identity).ext4"))
 
-        let resolution = try StorageLocationPolicy.validate(
-            container.path,
-            metrics: metrics,
-            probe: FakeVolumeProbe(result: volume(available: tight))
-        )
-        #expect(resolution.stateRoot == container.path)
+        #expect(throws: StorageLocationPolicyError.self) {
+            try StorageLocationPolicy.validate(
+                container.path,
+                metrics: metrics,
+                probe: FakeVolumeProbe(result: volume(available: tight))
+            )
+        }
     }
 
     @Test("skips the space check when the bundle metrics are unavailable")
@@ -666,22 +684,10 @@ struct StorageSpaceRequirementTests {
     func floorCoversTheFactoryImage() {
         let requirement = StorageSpaceRequirement(
             sourceBytes: sourceBytes,
-            workingBytes: workingBytes,
-            sourceAlreadyPresent: false
+            workingBytes: workingBytes
         )
         #expect(requirement.floorBytes == sourceBytes + StorageSpaceRequirement.headroomBytes)
-        #expect(requirement.comfortBytes == sourceBytes + workingBytes)
-    }
-
-    @Test("a materialized image leaves only the headroom to find")
-    func materializedImageLeavesHeadroom() {
-        let requirement = StorageSpaceRequirement(
-            sourceBytes: sourceBytes,
-            workingBytes: workingBytes,
-            sourceAlreadyPresent: true
-        )
-        #expect(requirement.floorBytes == StorageSpaceRequirement.headroomBytes)
-        #expect(requirement.comfortBytes == workingBytes)
+        #expect(requirement.comfortBytes == workingBytes + StorageSpaceRequirement.headroomBytes)
     }
 }
 
@@ -748,6 +754,7 @@ struct StorageLocationLaunchConfigurationTests {
             probe: FakeVolumeProbe(result: volume())
         )
         #expect(configuration.stateRoot == "/tmp/override-root")
+        #expect(configuration.resolvedStateRoot?.path == "/tmp/override-root")
         #expect(configuration.environment[StorageLocationPolicy.environmentKey] == "/tmp/override-root")
     }
 
@@ -763,6 +770,7 @@ struct StorageLocationLaunchConfigurationTests {
             probe: FakeVolumeProbe(result: volume())
         )
         #expect(configuration.stateRoot == container.path)
+        #expect(configuration.resolvedStateRoot?.path == container.path)
         #expect(configuration.environment[StorageLocationPolicy.environmentKey] == container.path)
     }
 
@@ -776,6 +784,34 @@ struct StorageLocationLaunchConfigurationTests {
         )
         #expect(configuration.stateRoot == nil)
         #expect(configuration.environment[StorageLocationPolicy.environmentKey] == nil)
+    }
+
+    @Test("default launches resolve a workspace for retaining VM fix results")
+    func defaultWorkspaceRetainsResults() throws {
+        let configuration = StorageLocationLaunchConfiguration.make(
+            baseEnvironment: [:], preference: .default, metrics: metrics
+        )
+        let root = try #require(configuration.resolvedStateRoot)
+        let support = try #require(FileManager.default.urls(
+            for: .applicationSupportDirectory, in: .userDomainMask
+        ).first)
+        #expect(root == support.appendingPathComponent("Try Omarchy/VM/v1", isDirectory: true).standardizedFileURL)
+        // Keep the regression independent of a real user disk or result cache.
+        let workspace = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        try FileManager.default.createDirectory(at: workspace.appendingPathComponent("disks/current"), withIntermediateDirectories: true)
+        try Data().write(to: workspace.appendingPathComponent("disks/current/rootfs.ext4"))
+        let selected = StorageLocationLaunchConfiguration.make(
+            baseEnvironment: [StorageLocationPolicy.environmentKey: workspace.path],
+            preference: .default, metrics: metrics
+        )
+        let cacheURL = try #require(GuestBootFixCache.url(storageRoot: selected.resolvedStateRoot))
+        let identity = String(repeating: "a", count: 64)
+        try GuestBootFixCache.retain(GuestBootFixReport(
+            schema: 1, type: "boot-fixes", identity: identity, state: "skipped",
+            components: GuestBootFixReport.pendingComponents
+        ), cacheURL: cacheURL)
+        #expect(GuestBootFixCache.needsReview(cacheURL: cacheURL, expectedIdentity: identity))
     }
 
     @Test("a rejected preference does not reach the launcher")
@@ -796,6 +832,7 @@ struct StorageLocationLaunchConfigurationTests {
         // callers refuse to start it at all. Reset depends on this: falling
         // back would erase the default VM instead of the chosen one.
         #expect(configuration.unavailableReason != nil)
+        #expect(configuration.resolvedStateRoot == nil)
     }
 
     @Test("an unreachable chosen folder reports why rather than falling back silently")
@@ -964,5 +1001,70 @@ struct StorageLocationMenuStateTests {
         )
         #expect(state.stateRoot == nil)
         #expect(state.problem != nil)
+    }
+}
+
+@Suite("Saved guest language support")
+struct SavedGuestLanguageSupportTests {
+    private var supportedMetrics: BundledGuestMetrics {
+        var result = metrics
+        result.supportsLanguageSelection = true
+        return result
+    }
+
+    @Test("a fresh workspace uses the bundled factory capability")
+    func freshWorkspace() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let environment = [StorageLocationPolicy.environmentKey: root.path]
+        #expect(QEMUGPUStorageSpaceEstimate.supportsLanguageSelection(environment: environment, metrics: supportedMetrics))
+        #expect(!QEMUGPUStorageSpaceEstimate.supportsLanguageSelection(environment: environment, metrics: metrics))
+    }
+
+    @Test("older saved disks use their own capability across app updates", arguments: ["current", String(repeating: "b", count: 64)])
+    func savedGuestCapability(directoryName: String) throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try writeValidRootMarker(in: root)
+        let identity = String(repeating: "b", count: 64)
+        try writeRecordedPersistentDisk(in: root, directoryName: directoryName, identity: identity)
+        let environment = [StorageLocationPolicy.environmentKey: root.path]
+        #expect(!QEMUGPUStorageSpaceEstimate.supportsLanguageSelection(environment: environment, metrics: supportedMetrics))
+
+        let boot = root.appendingPathComponent("boot")
+        let kit = boot.appendingPathComponent(identity)
+        try FileManager.default.createDirectory(at: kit, withIntermediateDirectories: true)
+        for directory in [boot, kit] {
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        }
+        let commandLine = kit.appendingPathComponent("command-line")
+        for (line, expected) in [
+            ("root=/dev/vda rw", false),
+            ("root=/dev/vda rw tryomarchy.locale_support=1", false),
+            ("root=/dev/vda rw tryomarchy.locale_support=20", false),
+            ("root=/dev/vda rw tryomarchy.locale_support=2\n", true),
+        ] {
+            try Data(line.utf8).write(to: commandLine)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: commandLine.path)
+            #expect(QEMUGPUStorageSpaceEstimate.supportsLanguageSelection(environment: environment, metrics: supportedMetrics) == expected)
+        }
+        // A custom storage preference must select the same VM, too.
+        let preference = StorageLocationPreference(containerPath: root.path)
+        #expect(QEMUGPUStorageSpaceEstimate.supportsLanguageSelection(environment: [:], metrics: supportedMetrics, preference: preference))
+        try FileManager.default.removeItem(at: commandLine)
+        let target = root.appendingPathComponent("untrusted-command-line")
+        try Data("tryomarchy.locale_support=2\n".utf8).write(to: target)
+        try FileManager.default.createSymbolicLink(at: commandLine, withDestinationURL: target)
+        #expect(!QEMUGPUStorageSpaceEstimate.supportsLanguageSelection(environment: environment, metrics: supportedMetrics))
+    }
+
+    @Test("a VM created from this factory keeps language support before boot-kit staging")
+    func currentFactory() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try writeRecordedPersistentDisk(in: root, directoryName: "current", identity: metrics.identity)
+        #expect(QEMUGPUStorageSpaceEstimate.supportsLanguageSelection(
+            environment: [StorageLocationPolicy.environmentKey: root.path], metrics: supportedMetrics
+        ))
     }
 }

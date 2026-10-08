@@ -6,9 +6,9 @@ usage() {
   cat <<'EOF'
 Usage: macos/build-qemu-gpu-runtime.sh [--archive-dir DIR]
 
-Build the pinned QEMU/VirGL source stack with Try Omarchy's Cocoa identity,
-dynamic-display, immersive-mode, pause-ownership, and pinch-zoom patches, then relocate,
-sign, validate, and
+Build the pinned QEMU/VirGL source stack for macOS 15.0 with Try Omarchy's Cocoa identity,
+dynamic-display, immersive-mode, pause-ownership, pinch-zoom, and ISO
+keyboard patches, then relocate, sign, validate, and
 atomically stage it at:
   macos/.build/qemu-gpu-runtime
 
@@ -16,10 +16,22 @@ The build is Apple-Silicon/HVF-only. It enables Cocoa+VirGL, SLIRP user
 networking, SDL duplex audio, and virtio-9p folder sharing. All downloaded source archives and wheels are
 immutable and checksum-pinned; scratch sources are removed on every exit.
 
+Set OMARCHY_RUNTIME_BUILD_JOBS to a positive integer to bound compilation.
 With --archive-dir, reuse already-downloaded pinned archives from DIR. Every
 archive is copied into private scratch space and checksum-verified before use.
 EOF
 }
+
+# Use the guarded array expansions below: Bash 3.2 treats an empty array as
+# unbound under nounset, even when it has been initialized.
+ninja_jobs=()
+if [[ -n ${OMARCHY_RUNTIME_BUILD_JOBS:-} ]]; then
+  [[ $OMARCHY_RUNTIME_BUILD_JOBS =~ ^[1-9][0-9]{0,5}$ ]] || {
+    echo 'qemu-source-build: OMARCHY_RUNTIME_BUILD_JOBS must be a positive integer' >&2
+    exit 64
+  }
+  ninja_jobs=(-j "$OMARCHY_RUNTIME_BUILD_JOBS")
+fi
 
 archive_cache=
 while (($#)); do
@@ -48,13 +60,23 @@ identity_patch="$native_dir/patches/qemu-cocoa-product-identity.patch"
 display_patch="$native_dir/patches/qemu-cocoa-dynamic-display.patch"
 immersive_patch="$native_dir/patches/qemu-cocoa-immersive-mode.patch"
 full_grab_patch="$native_dir/patches/qemu-cocoa-full-grab-focus.patch"
+reenable_patch="$native_dir/patches/qemu-cocoa-full-grab-reenable.patch"
 pause_ownership_patch="$native_dir/patches/qemu-cocoa-pause-ownership.patch"
 pinch_patch="$native_dir/patches/qemu-cocoa-pinch-zoom.patch"
+precise_scroll_patch="$native_dir/patches/qemu-cocoa-precise-scroll.patch"
+iso_swap_patch="$native_dir/patches/qemu-cocoa-iso-section-grave-swap.patch"
+injected_text_patch="$native_dir/patches/qemu-cocoa-injected-text.patch"
 audio_device_patch="$native_dir/patches/qemu-sdl-audio-device-selection.patch"
+audio_recovery_patch="$native_dir/patches/qemu-hda-full-ring-recovery.patch"
 shared_folder_patch="$native_dir/patches/qemu-9p-guest-owner.patch"
+memory_reclaim_patch="$native_dir/patches/qemu-hvf-free-page-reclaim.patch"
+mapped_sections_patch="$native_dir/patches/qemu-hvf-mapped-sections.patch"
 strchrnul_patch="$native_dir/patches/qemu-darwin-strchrnul-compat.patch"
+usb_exact_bus_patch="$native_dir/patches/qemu-usb-host-exact-bus.patch"
 slirp_patch="$native_dir/patches/libslirp-darwin-icmp-matching.patch"
 udp_patch="$native_dir/patches/libslirp-ipv4-udp-translation.patch"
+fence_poll_patch="$native_dir/patches/qemu-darwin-gpu-fence-poll.patch"
+virgl_native_patch="$native_dir/patches/virgl-native-opengl.patch"
 prepare_runtime="$native_dir/prepare-qemu-gpu-runtime.sh"
 pinned_bottles="$native_dir/pinned-runtime-bottles.sh"
 
@@ -70,11 +92,21 @@ identity_patch_sha256=5c9358c2858a74d6a678eacaae550a021f3e616c98c4e4e98c0e50bd86
 display_patch_sha256=1ce59350b6b8e6842bc0c9ca34c97f54cb75e85e2d7b35e5b483858654c4d693
 immersive_patch_sha256=2462463932f7db0d659f754f7f9c182884564dbcd7d4b8e523f1b57f0bd9fe5b
 full_grab_patch_sha256=f07a7417423f152e835f7f3c92414d10b9eb697817644a2b026fa1df12b7546c
+reenable_patch_sha256=f6ed7e01e1554049aa3cf2964d1f4a851cb1735208f9ddc88eeb608d1b7fbaed
 pause_ownership_patch_sha256=1a5729b36eb3e437395d41883a10c3c652df71d289d5df84d95aebd49c78a8f0
 pinch_patch_sha256=37acb8895dddd35fc66812d0c49ec5fc697f9127e9e12ed2e60d17999bf32aee
+precise_scroll_patch_sha256=54252b3b19358aa7e2c75d5f50775a7f488ef2d8b4db8723ba4768b56316a78f
+iso_swap_patch_sha256=57f33a5fb08fb90a7813b13bb7037a13198e4d7db230085b1faa28b284cf2387
+injected_text_patch_sha256=18d64d52f715d0cf1b2b6d1761059371e1859ee61faf3cc4800e2effc1ed4dd1
 audio_device_patch_sha256=03aca71c26163c337338cc3b2013c35430690fc0e8b66c5ce92a42f59a9b3334
+audio_recovery_patch_sha256=d1e93fd303777f424d7b11522fcf44bf726058901e85de3920c33e9083f301ea
 shared_folder_patch_sha256=41247692501655393ae3a40f56915472ab29b6e89c5173e33db1f62cca56632f
+memory_reclaim_patch_sha256=5d422130996b99145d017d4429df660a07c757388ef7d52cba389766c18b0acf
+mapped_sections_patch_sha256=2991378d565faeaf114bb5948bfa9ad05c39b078e4e1f4c2a674c3283800fab0
+fence_poll_patch_sha256=1ac407bdb617dfc52d004d0ebd0d07641d920f7d3a9756223c6426a207fb1499
+virgl_native_patch_sha256=692ed73cf88780b4c0e04c56e3cfb21cec761768dea909d755624e07d82fc60c
 strchrnul_patch_sha256=ec1048dd0e8ebe53bf7e8a3bca9bf2f5f4336cd607d4cd077437470e9a32094a
+usb_exact_bus_patch_sha256=5e39159171295c566d014a1ef2744130f80fa02b742c349fa47373b00ae697ec
 udp_patch_sha256=95e8ee890be78cdce70b3ee54a8adac27be02421be08b986ae987c74ef8cec8c
 slirp_patch_sha256=20f3d424c79929fb82d240d0ee06b99e9f93ecfb9460579dc414303820d59f90
 slirp_source_root=libslirp-v4.9.4
@@ -104,10 +136,16 @@ ninja_archive_name=ninja-1.13.0-py3-none-macosx_10_9_universal2.whl
 ninja_url="https://files.pythonhosted.org/packages/3c/74/d02409ed2aa865e051b7edda22ad416a39d81a84980f544f8de717cab133/$ninja_archive_name"
 ninja_sha256=fa2a8bfc62e31b08f83127d1613d10821775a0eb334197154c4d6067b7068ff1
 
-virgl_version=1.0.33
+virgl_version=1.0.42
 setuptools_archive_name=setuptools-84.0.0-py3-none-any.whl
 setuptools_url="https://files.pythonhosted.org/packages/95/9c/c510029fc6ef33a6275cd2c5d3cecd6613dfd6aa401d57c54f1c18852ccf/$setuptools_archive_name"
 setuptools_sha256=51a52592b3b99e102b609654876bd65f19f999935166d1352678931132b0c670
+
+# wheel 0.48 resolves `packaging` at install time and mkvenv runs offline, so
+# the vendored set must carry it; no Mac ships it with the system Python.
+packaging_archive_name=packaging-26.3-py3-none-any.whl
+packaging_url="https://files.pythonhosted.org/packages/63/34/ba1c580383c9eada3711951fef0795c80b829a078d72188184bcab9dd527/$packaging_archive_name"
+packaging_sha256=d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
 
 wheel_archive_name=wheel-0.48.0-py3-none-any.whl
 wheel_url="https://files.pythonhosted.org/packages/2e/29/69cfbb602cd91690c55d38ba9fe53e6a7e76a6fa647bf38f19c138d25449/$wheel_archive_name"
@@ -117,19 +155,30 @@ pip_archive_name=pip-26.2.1-py3-none-any.whl
 pip_url="https://files.pythonhosted.org/packages/f3/6e/1736e5b4ae2b778ef2f81c47d797de9f891d4d8acb047a24ca37a60294dd/$pip_archive_name"
 pip_sha256=71138adf1f4ca900cdb7d289c21b7494329f2332b6d85f0e1c42108c0384ed3e
 
-virgl_archive_name=virglrenderer-1.0.33.arm64_sequoia.bottle.tar.gz
-virgl_url="https://github.com/startergo/homebrew-virglrenderer/releases/download/v1.0.33/$virgl_archive_name"
-virgl_sha256=26ad3e927d300587024cd92276d38bf813f6228d130a1800c97f1c18688b34ba
+# Build the same renderer and patches as the 1.0.42 bottle, targeting 15.0.
+# The published bottle targets Tahoe; lowering only QEMU's target is insufficient.
+virgl_source_root=virglrenderer-1.3.0
+virgl_archive_name="$virgl_source_root.tar.gz"
+virgl_url="https://gitlab.freedesktop.org/virgl/virglrenderer/-/archive/1.3.0/$virgl_archive_name"
+virgl_sha256=065bc56e89e6f631f96101cd62eba0748e48eb888b434edc86e89d05395e76f3
+virgl_tap_root=homebrew-virglrenderer-1.0.42
+virgl_tap_archive_name="$virgl_tap_root.tar.gz"
+virgl_tap_url="https://codeload.github.com/startergo/homebrew-virglrenderer/tar.gz/refs/tags/v1.0.42"
+virgl_tap_sha256=950273fbba46905b6112ee2bd0598c1da706c25319a7347058cbc52f04ba96dd
+pyyaml_root=pyyaml-6.0.3
+pyyaml_archive_name="$pyyaml_root.tar.gz"
+pyyaml_url="https://files.pythonhosted.org/packages/05/8e/961c0007c59b8dd7729d542c61a4d537767a59645b82a0b521206e1e25c2/$pyyaml_archive_name"
+pyyaml_sha256=d76623373421df22fb4cf8817020cbb7ef15c725b9d5e45f17e189bfc384190f
 
-angle_version=1.0.15
-angle_archive_name=angle-1.0.15.arm64_sequoia.bottle.tar.gz
-angle_url="https://github.com/startergo/homebrew-angle/releases/download/v1.0.15/$angle_archive_name"
-angle_sha256=2b41a696f450a941016adf8b157e754c3223b6032ac9b9f0aac4216e899074c7
+angle_version=1.0.16
+angle_archive_name=angle-1.0.16.arm64_sequoia.bottle.tar.gz
+angle_url="https://github.com/startergo/homebrew-angle/releases/download/v1.0.16/$angle_archive_name"
+angle_sha256=29fe2175b157a65f12879f9a12b5c8f94d0a76fafdf41ff009a2fdb4e9df525c
 
-epoxy_version=1.0.4
-epoxy_archive_name=libepoxy-1.0.4.arm64_sequoia.bottle.tar.gz
-epoxy_url="https://github.com/startergo/homebrew-libepoxy/releases/download/v1.0.4/$epoxy_archive_name"
-epoxy_sha256=8787cc8c34921834665262dff4941216dd6717edddf2c6d5cdfe04f03b24c517
+epoxy_version=1.0.5
+epoxy_archive_name=libepoxy-1.0.5.arm64_sequoia.bottle.tar.gz
+epoxy_url="https://github.com/startergo/homebrew-libepoxy/releases/download/v1.0.5/$epoxy_archive_name"
+epoxy_sha256=109384a1d37edf207a9b9f3d8950710c00767635b3c7ff295e3af83611876ef2
 
 die() {
   echo "qemu-source-build: $*" >&2
@@ -165,18 +214,30 @@ macos_major=$(sw_vers -productVersion | awk -F. '{ print $1 }')
   die "missing immersive-mode patch: $immersive_patch"
 [[ -f $full_grab_patch && ! -L $full_grab_patch ]] || \
   die "missing Cocoa full-grab patch: $full_grab_patch"
+[[ -f $reenable_patch && ! -L $reenable_patch ]] || \
+  die "missing Cocoa full-grab re-enable patch: $reenable_patch"
 [[ -f $pause_ownership_patch && ! -L $pause_ownership_patch ]] || \
   die "missing Cocoa pause-ownership patch: $pause_ownership_patch"
 [[ -f $pinch_patch && ! -L $pinch_patch ]] || \
   die "missing Cocoa pinch-zoom patch: $pinch_patch"
+[[ -f $precise_scroll_patch && ! -L $precise_scroll_patch ]] || \
+  die "missing Cocoa precise-scroll patch: $precise_scroll_patch"
+[[ -f $iso_swap_patch && ! -L $iso_swap_patch ]] || \
+  die "missing Cocoa ISO Section/Grave swap patch: $iso_swap_patch"
 [[ -f $audio_device_patch && ! -L $audio_device_patch ]] || \
   die "missing SDL audio-device patch: $audio_device_patch"
 [[ -f $texture_patch && ! -L $texture_patch ]] || \
   die "missing texture-borrowing patch: $texture_patch"
 [[ -f $shared_folder_patch && ! -L $shared_folder_patch ]] || \
   die "missing 9p shared-folder patch: $shared_folder_patch"
+[[ -f $memory_reclaim_patch && ! -L $memory_reclaim_patch ]] || \
+  die "missing HVF free-page reclaim patch: $memory_reclaim_patch"
+[[ -f $mapped_sections_patch && ! -L $mapped_sections_patch ]] || \
+  die "missing HVF mapped-sections patch: $mapped_sections_patch"
 [[ -f $strchrnul_patch && ! -L $strchrnul_patch ]] || \
   die "missing Darwin strchrnul compatibility patch: $strchrnul_patch"
+[[ -f $usb_exact_bus_patch && ! -L $usb_exact_bus_patch ]] || \
+  die "missing USB exact-bus patch: $usb_exact_bus_patch"
 [[ -x $prepare_runtime && ! -L $prepare_runtime ]] || \
   die "missing runtime preparation script: $prepare_runtime"
 if [[ -n $archive_cache ]]; then
@@ -223,7 +284,7 @@ download_and_verify() {
 
   log "Downloading $label"
   curl --fail --location --silent --show-error \
-    --proto '=https' --tlsv1.2 --retry 3 --connect-timeout 20 \
+    --proto '=https' --tlsv1.2 --retry 3 --retry-all-errors --connect-timeout 20 \
     --output "$output" "$url"
   actual_sha=$(shasum -a 256 "$output" | awk '{ print $1 }')
   [[ $actual_sha == "$expected_sha" ]] || \
@@ -293,10 +354,13 @@ keycodemap_archive="$archive_dir/$keycodemap_archive_name"
 dtc_archive="$archive_dir/$dtc_archive_name"
 ninja_archive="$archive_dir/$ninja_archive_name"
 virgl_archive="$archive_dir/$virgl_archive_name"
+virgl_tap_archive="$archive_dir/$virgl_tap_archive_name"
+pyyaml_archive="$archive_dir/$pyyaml_archive_name"
 angle_archive="$archive_dir/$angle_archive_name"
 epoxy_archive="$archive_dir/$epoxy_archive_name"
 setuptools_archive="$archive_dir/$setuptools_archive_name"
 wheel_archive="$archive_dir/$wheel_archive_name"
+packaging_archive="$archive_dir/$packaging_archive_name"
 pip_archive="$archive_dir/$pip_archive_name"
 
 obtain_and_verify "libslirp source" "$slirp_url" "$slirp_sha256" "$slirp_archive"
@@ -305,7 +369,9 @@ obtain_and_verify "QEMU $qemu_commit" "$qemu_url" "$qemu_sha256" "$qemu_archive"
 obtain_and_verify "keycodemapdb $keycodemap_commit" "$keycodemap_url" "$keycodemap_sha256" "$keycodemap_archive"
 obtain_and_verify "dtc $dtc_commit" "$dtc_url" "$dtc_sha256" "$dtc_archive"
 obtain_and_verify "Ninja $ninja_version" "$ninja_url" "$ninja_sha256" "$ninja_archive"
-obtain_and_verify "virglrenderer $virgl_version" "$virgl_url" "$virgl_sha256" "$virgl_archive"
+obtain_and_verify "virglrenderer source" "$virgl_url" "$virgl_sha256" "$virgl_archive"
+obtain_and_verify "virglrenderer patches and regression tests" "$virgl_tap_url" "$virgl_tap_sha256" "$virgl_tap_archive"
+obtain_and_verify "PyYAML source" "$pyyaml_url" "$pyyaml_sha256" "$pyyaml_archive"
 obtain_and_verify "ANGLE $angle_version" "$angle_url" "$angle_sha256" "$angle_archive"
 obtain_and_verify "libepoxy $epoxy_version" "$epoxy_url" "$epoxy_sha256" "$epoxy_archive"
 while IFS=$'\t' read -r formula version archive_name archive_root archive_sha; do
@@ -318,12 +384,15 @@ done < <(pinned_core_bottle_manifest)
 
 obtain_and_verify "setuptools" "$setuptools_url" "$setuptools_sha256" "$setuptools_archive"
 obtain_and_verify "wheel" "$wheel_url" "$wheel_sha256" "$wheel_archive"
+obtain_and_verify "packaging" "$packaging_url" "$packaging_sha256" "$packaging_archive"
 obtain_and_verify "pip" "$pip_url" "$pip_sha256" "$pip_archive"
 
 validate_tar_root "QEMU $qemu_commit" "$qemu_archive" "$qemu_root" "$listing_dir/qemu.txt"
 validate_tar_root "keycodemapdb" "$keycodemap_archive" "$keycodemap_root" "$listing_dir/keycodemapdb.txt"
 validate_tar_root "dtc" "$dtc_archive" "$dtc_root" "$listing_dir/dtc.txt"
-validate_tar_root "virglrenderer" "$virgl_archive" "virglrenderer/$virgl_version" "$listing_dir/virglrenderer.txt"
+validate_tar_root "virglrenderer" "$virgl_archive" "$virgl_source_root" "$listing_dir/virglrenderer.txt"
+validate_tar_root "virglrenderer patches" "$virgl_tap_archive" "$virgl_tap_root" "$listing_dir/virgl-tap.txt"
+validate_tar_root "PyYAML" "$pyyaml_archive" "$pyyaml_root" "$listing_dir/pyyaml.txt"
 validate_tar_root "ANGLE" "$angle_archive" "angle/$angle_version" "$listing_dir/angle.txt"
 validate_tar_root "libepoxy" "$epoxy_archive" "libepoxy/$epoxy_version" "$listing_dir/libepoxy.txt"
 
@@ -336,7 +405,12 @@ patch -d "$source_parent/$slirp_source_root" -p1 -f -i "$slirp_patch"
 verify_file_sha "IPv4 UDP reply translation patch" "$udp_patch" "$udp_patch_sha256"
 patch -d "$source_parent/$slirp_source_root" -p1 -f -i "$udp_patch"
 tar -xzf "$qemu_archive" -C "$source_parent"
-tar -xzf "$virgl_archive" -C "$dependency_root"
+tar -xzf "$virgl_archive" -C "$source_parent"
+tar -xzf "$virgl_tap_archive" -C "$source_parent"
+tar -xzf "$pyyaml_archive" -C "$tool_root"
+# Use the pinned pure-Python YAML implementation for generated Gallium tables.
+export PYTHONPATH="$tool_root/$pyyaml_root/lib"
+export PYTHONNOUSERSITE=1
 tar -xzf "$angle_archive" -C "$dependency_root"
 tar -xzf "$epoxy_archive" -C "$dependency_root"
 while IFS=$'\t' read -r formula version archive_name archive_root archive_sha; do
@@ -348,7 +422,7 @@ source_dir="$source_parent/$qemu_root"
   die "QEMU source archive is incomplete"
 
 install -m 0644 "$setuptools_archive" "$wheel_archive" "$pip_archive" \
-  "$source_dir/python/wheels/"
+  "$packaging_archive" "$source_dir/python/wheels/"
 
 mkdir -p "$source_dir/subprojects/keycodemapdb" "$source_dir/subprojects/dtc"
 tar -xzf "$keycodemap_archive" -C "$source_dir/subprojects/keycodemapdb" --strip-components=1
@@ -363,29 +437,56 @@ verify_file_sha "Try Omarchy Cocoa immersive-mode patch" \
   "$immersive_patch" "$immersive_patch_sha256"
 verify_file_sha "Try Omarchy Cocoa full-grab patch" \
   "$full_grab_patch" "$full_grab_patch_sha256"
+verify_file_sha "Try Omarchy Cocoa full-grab re-enable patch" \
+  "$reenable_patch" "$reenable_patch_sha256"
 verify_file_sha "Try Omarchy Cocoa pause-ownership patch" \
   "$pause_ownership_patch" "$pause_ownership_patch_sha256"
 verify_file_sha "Try Omarchy Cocoa pinch-zoom patch" \
   "$pinch_patch" "$pinch_patch_sha256"
+verify_file_sha "Try Omarchy Cocoa precise-scroll patch" \
+  "$precise_scroll_patch" "$precise_scroll_patch_sha256"
+verify_file_sha "Try Omarchy Cocoa ISO Section/Grave swap patch" \
+  "$iso_swap_patch" "$iso_swap_patch_sha256"
+verify_file_sha "Try Omarchy Cocoa injected-text patch" \
+  "$injected_text_patch" "$injected_text_patch_sha256"
 verify_file_sha "Try Omarchy SDL audio-device patch" \
   "$audio_device_patch" "$audio_device_patch_sha256"
 verify_file_sha "Try Omarchy 9p shared-folder patch" \
   "$shared_folder_patch" "$shared_folder_patch_sha256"
+verify_file_sha "Try Omarchy HVF free-page reclaim patch" \
+  "$memory_reclaim_patch" "$memory_reclaim_patch_sha256"
+verify_file_sha "Try Omarchy HVF mapped-sections patch" \
+  "$mapped_sections_patch" "$mapped_sections_patch_sha256"
+verify_file_sha "Try Omarchy Darwin GPU fence polling patch" \
+  "$fence_poll_patch" "$fence_poll_patch_sha256"
 verify_file_sha "Try Omarchy Darwin strchrnul compatibility patch" \
   "$strchrnul_patch" "$strchrnul_patch_sha256"
+verify_file_sha "Try Omarchy USB exact-bus patch" \
+  "$usb_exact_bus_patch" "$usb_exact_bus_patch_sha256"
 
-log "Applying the exact render, identity, display, immersive, pause-ownership, audio, folder, Darwin compatibility, and pinch patches"
+log "Applying the exact render, identity, display, immersive, pause-ownership, audio, folder, Darwin compatibility, memory reclaim, pinch, precise-scroll, ISO keyboard, and USB exact-bus patches"
 patch -d "$source_dir" -p1 -f -i "$texture_patch"
 patch -d "$source_dir" -p1 -f -i "$gpu_fix_patch"
 patch -d "$source_dir" -p1 -f -i "$identity_patch"
 patch -d "$source_dir" -p1 -f -i "$display_patch"
 patch -d "$source_dir" -p1 -f -i "$immersive_patch"
 patch -d "$source_dir" -p1 -f -i "$full_grab_patch"
+patch -d "$source_dir" -p1 -f -i "$reenable_patch"
 patch -d "$source_dir" -p1 -f -i "$pause_ownership_patch"
+verify_file_sha "Try Omarchy HDA full-ring recovery patch" \
+  "$audio_recovery_patch" "$audio_recovery_patch_sha256"
 patch -d "$source_dir" -p1 -f -i "$audio_device_patch"
+patch -d "$source_dir" -p1 -f -i "$audio_recovery_patch"
 patch -d "$source_dir" -p1 -f -i "$shared_folder_patch"
 patch -d "$source_dir" -p1 -f -i "$strchrnul_patch"
+patch -d "$source_dir" -p1 -f -i "$memory_reclaim_patch"
+patch -d "$source_dir" -p1 -f -i "$mapped_sections_patch"
+patch -d "$source_dir" -p1 -f -i "$fence_poll_patch"
 patch -d "$source_dir" -p1 -f -i "$pinch_patch"
+patch -d "$source_dir" -p1 -f -i "$precise_scroll_patch"
+patch -d "$source_dir" -p1 -f -i "$iso_swap_patch"
+patch -d "$source_dir" -p1 -f -i "$injected_text_patch"
+patch -d "$source_dir" -p1 -f -i "$usb_exact_bus_patch"
 
 virgl_root="$dependency_root/virglrenderer/$virgl_version"
 angle_root="$dependency_root/angle/$angle_version"
@@ -393,6 +494,7 @@ epoxy_root="$dependency_root/libepoxy/$epoxy_version"
 glib_root="$dependency_root/$PINNED_GLIB_ROOT"
 pixman_root="$dependency_root/$PINNED_PIXMAN_ROOT"
 slirp_root="$dependency_root/$PINNED_LIBSLIRP_ROOT"
+libusb_root="$dependency_root/$PINNED_LIBUSB_ROOT"
 sdl2_root="$dependency_root/$PINNED_SDL2_ROOT"
 sdl3_root="$dependency_root/$PINNED_SDL3_ROOT"
 gettext_root="$dependency_root/$PINNED_GETTEXT_ROOT"
@@ -401,16 +503,14 @@ zstd_root="$dependency_root/$PINNED_ZSTD_ROOT"
 lz4_root="$dependency_root/$PINNED_LZ4_ROOT"
 xz_root="$dependency_root/$PINNED_XZ_ROOT"
 for directory in \
-  "$virgl_root" "$angle_root" "$epoxy_root" \
-  "$glib_root" "$pixman_root" "$slirp_root" "$sdl2_root" "$sdl3_root" \
+  "$angle_root" "$epoxy_root" \
+  "$glib_root" "$pixman_root" "$slirp_root" "$libusb_root" "$sdl2_root" "$sdl3_root" \
   "$gettext_root" "$pcre2_root" "$zstd_root" "$lz4_root" "$xz_root"; do
   [[ -d $directory && ! -L $directory ]] || die "missing extracted dependency: $directory"
 done
 
 # Bottle pkg-config files contain Homebrew relocation placeholders. Point only
 # this private build at the verified extracted headers and libraries.
-sed -i '' "s|@@HOMEBREW_CELLAR@@/virglrenderer/$virgl_version|$virgl_root|g" \
-  "$virgl_root/lib/pkgconfig/virglrenderer.pc"
 sed -i '' "s|@@HOMEBREW_CELLAR@@/libepoxy/$epoxy_version|$epoxy_root|g" \
   "$epoxy_root/lib/pkgconfig/epoxy.pc"
 for pc_file in "$angle_root"/lib/pkgconfig/*.pc; do
@@ -432,6 +532,9 @@ done
 for pc_file in "$pcre2_root"/lib/pkgconfig/*.pc; do
   sed -i '' "s|@@HOMEBREW_CELLAR@@/$PINNED_PCRE2_ROOT|$pcre2_root|g" "$pc_file"
 done
+for pc_file in "$libusb_root"/lib/pkgconfig/*.pc; do
+  sed -i '' "s|@@HOMEBREW_CELLAR@@/$PINNED_LIBUSB_ROOT|$libusb_root|g" "$pc_file"
+done
 sed -i '' \
   -e "s|^prefix=@@HOMEBREW_PREFIX@@$|prefix=$sdl2_root|" \
   -e "s|^libdir=@@HOMEBREW_PREFIX@@/lib$|libdir=$sdl2_root/lib|" \
@@ -448,8 +551,8 @@ ninja="$tool_root/ninja-$ninja_version.data/scripts/ninja"
 [[ -f $ninja && ! -L $ninja ]] || die "pinned Ninja wheel is missing its executable"
 chmod 0755 "$ninja"
 
-pkg_config_libdir="$virgl_root/lib/pkgconfig:$epoxy_root/lib/pkgconfig:$angle_root/lib/pkgconfig:$glib_root/lib/pkgconfig:$pixman_root/lib/pkgconfig:$slirp_root/lib/pkgconfig:$sdl2_root/lib/pkgconfig:$pcre2_root/lib/pkgconfig"
-private_libraries="$virgl_root/lib:$epoxy_root/lib:$angle_root/lib:$glib_root/lib:$pixman_root/lib:$slirp_root/lib:$sdl2_root/lib:$gettext_root/lib:$pcre2_root/lib"
+pkg_config_libdir="$virgl_root/lib/pkgconfig:$epoxy_root/lib/pkgconfig:$angle_root/lib/pkgconfig:$glib_root/lib/pkgconfig:$pixman_root/lib/pkgconfig:$slirp_root/lib/pkgconfig:$sdl2_root/lib/pkgconfig:$pcre2_root/lib/pkgconfig:$libusb_root/lib/pkgconfig"
+private_libraries="$virgl_root/lib:$epoxy_root/lib:$angle_root/lib:$glib_root/lib:$pixman_root/lib:$slirp_root/lib:$sdl2_root/lib:$gettext_root/lib:$pcre2_root/lib:$libusb_root/lib"
 
 require_private_pkg_version() {
   local package=$1
@@ -458,7 +561,7 @@ require_private_pkg_version() {
 
   actual=$(env PKG_CONFIG_PATH= PKG_CONFIG_LIBDIR="$pkg_config_libdir" \
     pkg-config --modversion "$package" 2>/dev/null) || \
-    die "pinned bottle set is missing pkg-config dependency: $package $expected"
+    die "private dependency set is missing pkg-config dependency: $package $expected"
   [[ $actual == "$expected" ]] || \
     die "$package version mismatch: expected $expected, got $actual"
 }
@@ -467,8 +570,71 @@ require_private_pkg_version glib-2.0 2.88.3
 require_private_pkg_version pixman-1 0.46.4
 require_private_pkg_version slirp 4.9.4
 require_private_pkg_version sdl2 2.32.70
-require_private_pkg_version virglrenderer 1.2.0
 require_private_pkg_version epoxy 1.5.11
+require_private_pkg_version libusb-1.0 1.0.30
+
+# Keep the exact graphics fixes, including GLES dual-source output for Alacritty.
+virgl_source="$source_parent/$virgl_source_root"
+virgl_tap="$source_parent/$virgl_tap_root"
+virgl_patches=(
+  virglrenderer-debug-init-logging.patch
+  virglrenderer-default-debug-log.patch
+  virglrenderer-macos-unified.patch
+  virglrenderer-venus-metal-func-ptrs.patch
+  virglrenderer-gallium-endian.patch
+  virglrenderer-macos-a8-swizzle.patch
+  virglrenderer-corefoundation-link.patch
+  virglrenderer-a8-shader-swizzle.patch
+  virglrenderer-a8-shader-swizzle-texture.patch
+  virglrenderer-a8-unpack-alignment.patch
+  virglrenderer-bgra-upload-swizzle-core.patch
+  virglrenderer-msaa-assertion-fix.patch
+  virglrenderer-ignore-surface0-clear.patch
+  virglrenderer-venus-errno-debug.patch
+  virglrenderer-macos-profile-forcing.patch
+  virglrenderer-macos-egl-profile.patch
+  virglrenderer-texture-swizzle-core.patch
+  virglrenderer-bgra-unified.patch
+  virglrenderer-core-profile-frag-datalocation.patch
+  virglrenderer-macos-core-profile-fixes.patch
+  virglrenderer-gles-dual-source-output.patch
+)
+for virgl_patch in "${virgl_patches[@]}"; do
+  patch -d "$virgl_source" -p1 -f -i "$virgl_tap/patches/$virgl_patch"
+done
+verify_file_sha "Native OpenGL browser compatibility patch" "$virgl_native_patch" "$virgl_native_patch_sha256"
+patch -d "$virgl_source" -p1 -f -i "$virgl_native_patch"
+virgl_build="$virgl_source/build"
+meson="$tool_root/$meson_root/meson.py"
+# Optimize the graphics command path while retaining assertions and diagnostics.
+log "Building optimized patched VirGL 1.3.0 for macOS $macos_deployment_target"
+env MACOSX_DEPLOYMENT_TARGET="$macos_deployment_target" \
+  PKG_CONFIG_PATH= PKG_CONFIG_LIBDIR="$pkg_config_libdir" \
+  DYLD_LIBRARY_PATH="$private_libraries" \
+  PATH="$(dirname "$ninja"):$PATH" \
+  CFLAGS="-I$angle_root/include -mmacosx-version-min=$macos_deployment_target -Werror=unguarded-availability-new" \
+  OBJCFLAGS="-mmacosx-version-min=$macos_deployment_target -Werror=unguarded-availability-new" \
+  LDFLAGS="-mmacosx-version-min=$macos_deployment_target -Wl,-headerpad_max_install_names" \
+  python3 "$meson" setup "$virgl_build" "$virgl_source" \
+    --prefix="$virgl_root" --libdir=lib --buildtype=debugoptimized -Db_ndebug=false --wrap-mode=nodownload \
+    -Ddrm-renderers=[] -Dvenus=true -Dtests=false -Dvideo=false -Dtracing=none
+"$ninja" ${ninja_jobs[@]+"${ninja_jobs[@]}"} -C "$virgl_build"
+# These test the actual shader generator and blend-state transitions, without a VM.
+env DYLD_LIBRARY_PATH="$private_libraries" \
+  python3 "$virgl_tap/tests/run-driver-regressions.py" \
+    "$virgl_build" "$work_dir/virgl-regressions" -- \
+    "-L$epoxy_root/lib" -lepoxy \
+    -framework Metal -framework CoreFoundation -lobjc \
+    "-Wl,-rpath,$epoxy_root/lib" "-Wl,-rpath,$angle_root/lib"
+# Probe real format-selection code with controlled GL availability and failures.
+env DYLD_LIBRARY_PATH="$private_libraries" \
+  python3 "$native_dir/Tests/virgl/run-regressions.py" \
+    "$virgl_build" "$work_dir/virgl-regressions" -- \
+    "-L$epoxy_root/lib" -lepoxy \
+    -framework Metal -framework CoreFoundation -lobjc \
+    "-Wl,-rpath,$epoxy_root/lib" "-Wl,-rpath,$angle_root/lib"
+python3 "$meson" install -C "$virgl_build" --no-rebuild
+require_private_pkg_version virglrenderer 1.3.0
 
 # Build against the same pinned private GLib used by QEMU; never use host libraries.
 slirp_build="$source_parent/$slirp_source_root/build"
@@ -482,7 +648,7 @@ env MACOSX_DEPLOYMENT_TARGET="$macos_deployment_target" \
   LDFLAGS="-mmacosx-version-min=$macos_deployment_target -Wl,-headerpad_max_install_names" \
   python3 "$meson" setup "$slirp_build" "$source_parent/$slirp_source_root" \
     --prefix="$slirp_root" --libdir=lib --buildtype=release --wrap-mode=nodownload
-"$ninja" -C "$slirp_build"
+"$ninja" ${ninja_jobs[@]+"${ninja_jobs[@]}"} -C "$slirp_build"
 for image in \
   "$slirp_build"/libslirp.0.dylib \
   "$slirp_build"/*test \
@@ -510,7 +676,7 @@ python3 "$meson" install -C "$slirp_build" --no-rebuild
 
 build_dir="$source_dir/build"
 mkdir "$build_dir"
-log "Configuring QEMU 11.1.1 (HVF-only, Cocoa/VirGL, SLIRP, SDL audio, virtio-9p) for macOS $macos_deployment_target and newer"
+log "Configuring QEMU 11.1.1 (HVF-only, Cocoa/VirGL, SLIRP, SDL audio, virtio-9p, libusb) for macOS $macos_deployment_target and newer"
 (
   cd "$build_dir"
   env MACOSX_DEPLOYMENT_TARGET="$macos_deployment_target" \
@@ -534,9 +700,12 @@ log "Configuring QEMU 11.1.1 (HVF-only, Cocoa/VirGL, SLIRP, SDL audio, virtio-9p
       --enable-sdl \
       --audio-drv-list=sdl \
       --enable-virtfs \
+      --enable-libusb \
       --disable-debug-info \
       --disable-werror \
       --disable-download \
+      --disable-containers \
+      --container-command=false \
       --extra-cflags="-mmacosx-version-min=$macos_deployment_target -Werror=unguarded-availability-new" \
       --extra-ldflags="-mmacosx-version-min=$macos_deployment_target" \
       --ninja="$ninja"
@@ -590,7 +759,7 @@ env MACOSX_DEPLOYMENT_TARGET="$macos_deployment_target" \
   PKG_CONFIG_LIBDIR="$pkg_config_libdir" \
   DYLD_LIBRARY_PATH="$private_libraries" \
   DYLD_FALLBACK_LIBRARY_PATH="$private_libraries" \
-  "$ninja" -C "$build_dir" qemu-system-aarch64
+  "$ninja" ${ninja_jobs[@]+"${ninja_jobs[@]}"} -C "$build_dir" qemu-system-aarch64
 
 qemu_binary="$build_dir/qemu-system-aarch64"
 description=$(file -b "$qemu_binary")
@@ -601,6 +770,7 @@ log "Relocating, capability-gating, signing, and publishing the runtime"
 "$prepare_runtime" \
   --source-qemu "$qemu_binary" \
   --source-slirp "$slirp_root/lib/libslirp.0.dylib" \
+  --source-virgl "$virgl_root/lib/libvirglrenderer.1.dylib" \
   --archive-dir "$archive_dir"
 
 log "Pinned patched runtime is ready; scratch source and archives will now be removed"

@@ -21,6 +21,7 @@ Omarchy's trademark rights.
 - Resizable native window with automatic guest resolution and HiDPI scale updates
 - Mac audio input/output selection inside Omarchy, with live routing and system-default fallback
 - FaceTime HD and other Mac cameras exposed to Omarchy as an on-demand 720p webcam
+- The Mac's battery charge and charging state mirrored into the Omarchy bar
 - Two-way clipboard sharing for text and PNG images between macOS and Omarchy
 - One optional shared Mac folder, available inside Omarchy under the same name (`~/Work` stays `~/Work`)
 - Loopback-only TCP and UDP port forwarding from the Mac into Omarchy
@@ -93,13 +94,13 @@ depth and priority inversion.
 
 ### Graphics chain
 
-Rendering reaches the GPU through Metal, but nothing in QEMU speaks Metal.
-virglrenderer replays the guest's commands as OpenGL ES, and ANGLE translates
-those into Metal, which is why the display is started with `gl=es`.
+The display uses QEMU's native macOS OpenGL backend (`gl=on`). VirGL replays
+Linux graphics commands in an Apple OpenGL 4.1 core context, backed by the
+Apple Silicon GPU.
 
 ```
-Hyprland / Omarchy
-  |  OpenGL
+Browser / Hyprland / Omarchy
+  |  OpenGL or OpenGL ES
   v
 Mesa virgl driver                       guest
   |  command stream
@@ -107,28 +108,23 @@ Mesa virgl driver                       guest
 virtio-gpu-gl-pci  ─────────────────────────── VM boundary
   |
   v
-virglrenderer                           host, replays as OpenGL ES
+virglrenderer                           host, replays as desktop OpenGL
   |
   v
-ANGLE  (libGLESv2.dylib, libEGL.dylib)  translates GL ES -> Metal
-  |
-  v
-Metal.framework                         Apple silicon GPU
+Apple OpenGL driver / Cocoa              Apple Silicon GPU
 ```
 
-Two things this makes explicit. The guest sees a plain virtio GPU and needs no
-Apple-specific driver. And the acceleration is real rather than a software
-rasteriser: `libGLESv2.dylib` and `libEGL.dylib` link `Metal.framework`
-directly, and the guest reports the renderer as
-`ANGLE (Apple, ANGLE Metal Renderer: <chip>)`.
+The guest sees a virtio GPU and needs no Apple-specific driver. The shared
+renderer preserves real multisample support and uses mutable multisample
+textures when macOS lacks immutable multisample storage. This allows browsers
+to create the ES 3 contexts they need for default acceleration, without
+browser-specific flags. Native Apple drivers also select integer vertex
+attributes automatically, with alpha and BGRA textures converted once.
+Hardware video decoding and Vulkan remain unavailable.
 
-This chain is unchanged by the QEMU 11.1.1 move. That work touched the
-interrupt controller and the GL scanout plumbing — how a rendered texture is
-handed to the Cocoa window — not the rendering backend.
-
-Note that the upstream tap this builds from is named
-`homebrew-qemu-virgl-kosmickrisp`, but KosmicKrisp, Mesa's Vulkan-to-Metal
-driver, is not part of this path.
+The runtime also bundles pinned ANGLE libraries for its upstream compatibility
+code. ANGLE's Metal backend is not the default display path. KosmicKrisp,
+Mesa's Vulkan-to-Metal driver, is not part of this path.
 
 ### Not yet verified
 
@@ -142,7 +138,13 @@ port. The `dtc` mirror should be reverted once kernel.org returns.
 2. Open the DMG and drag **Try Omarchy** to **Applications**.
 3. Launch **Try Omarchy** from Applications.
 
-Every launch begins at the start menu. While that menu is open, Try Omarchy behaves like a regular Mac app with standard Quit, Close Window, and Minimize commands; after the VM starts, that native app chrome steps aside for Omarchy. **Immersive** is on by default, so Omarchy opens Full Screen with the Mac menu bar and Dock hidden. Turn it off to open a resizable window; if you later enter Full Screen, the Mac menu bar and Dock remain available at the screen edges. Whenever the Omarchy window is focused, Command belongs to the guest as Super in either mode, except Command-Tab and Shift-Command-Tab, which continue to switch macOS applications. Accessibility permission enables capture of system shortcuts such as Command-Space for the guest; no separate Input Monitoring entry is required. Microphone and camera access are optional. The first launch takes longer while the app prepares Linux and starts Omarchy's account provisioning.
+By default, every launch begins at the launcher. Enable **Skip launcher** to start Omarchy using your saved settings on subsequent launches. A confirmation explains how to return to the launcher; choose **OK** to enable **Skip launcher** or **Cancel** to leave it off. Hold **Option** while opening the app to show the launcher again and change settings or turn **Skip launcher** off. You can also open **Setup → Try Omarchy Settings** inside Omarchy. Skip launcher is saved with the VM workspace; deleting that workspace clears the choice. A missing VM disk always shows the launcher, even if its settings file remains. Reset requests still show the confirmation flow. Startup checks still show any required recovery or error dialogs.
+
+While that menu is open, Try Omarchy behaves like a regular Mac app. **Try Omarchy → Settings…** (**Command-comma**) brings the launcher or its open editor forward without discarding drafts. The menus also provide standard text editing, Services, Hide Others, Show All, and window commands, including Bring All to Front. **Help** opens the user guide, maintenance and recovery notes, or the issue tracker in your browser. After the VM starts, that native app chrome steps aside for Omarchy. **Immersive** is on by default, so Omarchy opens Full Screen with the Mac menu bar and Dock hidden. Turn it off to open a resizable window; if you later enter Full Screen, the Mac menu bar and Dock remain available at the screen edges. Whenever the Omarchy window is focused, Command belongs to the guest as Super in either mode, except Command-Tab and Shift-Command-Tab, which switch macOS applications; an exact Ctrl+` chord remains available to host bindings. Accessibility permission lets other system shortcuts such as Command-Space reach the guest before macOS. Microphone and camera access are optional. The first launch takes longer while the app prepares Linux and starts Omarchy's account provisioning.
+
+Inside Omarchy, choose **Setup → Try Omarchy Settings**, search for **Try Omarchy Settings**, or run `omarchy-native-settings` to reopen the Mac settings window. You can change **Skip launcher**, permissions, CPU, memory, sharing, port forwarding, and immersive mode here. CPU, memory, sharing, ports, and immersive mode are saved for the next launch; **Restart Omarchy** shuts down Linux and starts a new VM process to apply them. Save your work first. A disposable VM keeps its disk across this restart until you close the app.
+
+For VM location and reset, choose **Shut Down**. The settings window stays open even with **Skip launcher** enabled; reset still asks for confirmation. **Done** or closing the running settings window returns to Omarchy without stopping it. Existing VMs [receive settings access automatically](guest/README.md#settings-access-from-an-existing-vm) when launched with the updated app, without a reset or manual installation.
 
 Restarting from inside Omarchy reboots the guest in the same Try Omarchy app.
 Shutting down Omarchy closes the app and leaves it closed.
@@ -150,15 +152,37 @@ Shutting down Omarchy closes the app and leaves it closed.
 ## Virtual machine resources
 
 Choose **Resources → Configure…** on the start menu to adjust processor cores
-and memory for the next launch. Processor cores range from 4 to all the cores
+and memory, and set a maximum disk size for the next launch. Processor cores range from 4 to all the cores
 on this Mac; the default remains up to 8 cores. Memory defaults to 8 GiB on
 Macs with at least 16 GiB of RAM, and 4 GiB on smaller Macs. Custom allocations
 can leave as little as 4 GiB for macOS; higher choices carry a performance note.
 
-**Save** remembers both choices. **Cancel** leaves them unchanged, and
+**Maximum disk size (GiB)** defaults to **64 GiB** for new launcher settings,
+and supports capacities up to 8192 GiB.
+Mac storage is allocated as the guest writes data, rather than reserving the
+whole maximum in advance. For example, choosing 256 GiB does not immediately
+use 256 GiB on the Mac. The volume still needs free space as the VM fills it;
+the maximum is guest capacity, not a quota on backups or total app storage.
+
+Keep the displayed value to retain the current capacity. Larger values sparsely
+extend the stopped disk at the next launch; the guest expands its root filesystem
+on boot. Existing disks cannot
+shrink. **Use Defaults** selects 64 GiB, or the existing capacity if larger.
+Previously saved settings without a disk maximum retain their current capacity.
+A disk previously grown with the CLI remains at least that large. For direct launcher script usage,
+set `OMARCHY_QEMU_GPU_DISK_GIB=256`.
+
+**Save** remembers these choices. **Cancel** leaves them unchanged, and
 **Use Defaults** restores the draft until you save. Existing memory preferences
 are carried forward. A choice that no longer fits a smaller Mac falls back to
 its default without erasing the saved choice.
+
+## Ghostty
+
+Choose **Install → Terminal → Ghostty** to download verified Ghostty sources
+and build an ARM64 package inside the guest. The first build takes several
+minutes and needs at least 3 GiB free. The installer uses software rendering
+for compatibility with the VM. See [installation, existing VMs and limitations](docs/ghostty.md).
 
 ## 1Password
 
@@ -204,6 +228,139 @@ first Omarchy account created during
 provisioning. Additional guest accounts can reach the same share, with each
 entry's normal Unix permission bits deciding whether they can modify it.
 
+The share uses `cache=readahead` to avoid the 9p writeback corruption risk in
+older guest kernels. Writable shared memory mappings are unavailable; keep
+databases and mmap-based IPC files on the guest's local disk. See
+[shared-folder safety](docs/shared-folder-safety.md) for existing-VM protection,
+verification, and mitigation on older app versions.
+
+## Passing a USB device to Omarchy (experimental)
+
+Passthrough is off until you pick a device. Use **Choose…** next to **USB
+device** on the start menu to select one device currently attached to the Mac;
+the choice applies on the next launch, and **Turn On** / **Turn Off** keeps it
+without reselecting. Omarchy gets a USB 3 controller with that one device
+attached, matched on its vendor and product identifiers and its physical bus
+and port. The picker lists the bus and port for each device. The match stays
+fixed even when only one device is connected, so unplugging it cannot hand an
+identical device on another port to the guest. Moving a device to another port
+requires choosing it again. If the saved device is absent at launch, Omarchy
+starts without USB passthrough. Old selections without a saved location must
+also be chosen again.
+
+Upstream QEMU treats `hostbus=0` as "any bus", and libusb numbers the first
+USB controller 0 — on a Mac with a dock, usually the controller behind every
+dock and hub port. The bundled QEMU carries
+`macos/patches/qemu-usb-host-exact-bus.patch` so that `hostbus=0` selects bus 0
+exactly, and the launcher refuses a runtime without it. The selection
+identifies a model at a physical port, not a serial number; replacing it with
+the same model at the same port still matches.
+
+Only one device at a time, and never a USB hub — passing a hub through would
+take every device behind it, frequently this Mac's own dock, keyboard, or
+display controls.
+
+**What gets through depends entirely on privilege.** libusb's Darwin backend
+accepts exactly two kinds of caller for taking a device away from macOS -- a
+process holding `com.apple.vm.device-access`, or one running as root -- and
+turns every other caller away before it asks the kernel anything:
+
+```c
+/* libusb/os/darwin_usb.c, darwin_detach_kernel_driver() */
+if (0 != geteuid()) {
+  usbi_warn (ctx, "USB device capture requires either an entitlement "
+                  "(com.apple.vm.device-access) or root privilege");
+  return LIBUSB_ERROR_ACCESS;
+}
+```
+
+**Unprivileged, which is how this app ships:** only a device no macOS driver
+has claimed, which is rarer than it sounds. Surveying every USB device attached
+to one Apple Silicon Mac found a driver bound to all of them: hubs, docks
+(through `AppleUSBHostBillboardDevice`), HID receivers, audio interfaces, USB
+Ethernet and mass storage. What is left is hardware macOS has no driver for at
+all, such as SDR receivers, JTAG probes and custom vendor-specific boards.
+Everything else enumerates in the guest but never gets a configuration: `lsusb`
+lists it while `/sys/bus/usb/devices/*/bConfigurationValue` stays empty, and no
+`sda`, input device or camera appears. Both `libusb_detach_kernel_driver` and
+`libusb_claim_interface` return `LIBUSB_ERROR_ACCESS` immediately, without the
+kernel ever being asked.
+
+**As root, this same build takes a driver-claimed device completely.** Measured
+on one Apple Silicon Mac with a SanDisk 3.2Gen1 stick, a device class macOS
+drives through `IOUSBMassStorageDriver`:
+
+```
+# inside the guest
+$ lsblk
+sda      57.3G disk
+|-sda1     200M part vfat  EFI
+`-sda2      57G part vfat  VCAUSB  /run/media/vcanuel/VCAUSB
+$ cat /sys/bus/usb/devices/2-1/speed
+5000
+$ readlink /sys/bus/usb/devices/2-1:1.0/driver
+../../../../../../../../bus/usb/drivers/usb-storage
+$ dd if=/dev/urandom of=/run/media/vcanuel/VCAUSB/u.bin bs=1M count=256 conv=fsync
+268435456 bytes (268 MB, 256 MiB) copied, 3.69127 s, 72.7 MB/s
+```
+
+The volume mounts on the Omarchy desktop like any other drive, and writes land
+on the stick at SuperSpeed. Nothing in the passthrough path itself needs
+changing for this; only the privilege of the process that calls libusb.
+
+The xHCI controller is started with `streams=off`, so the guest uses
+`usb-storage` rather than `uas`. With streams on, `uas` binds the same stick
+but the first command after each connection gets no answer: after a replug,
+`REPORT LUNS` and then `INQUIRY` each timed out after 30 s and forced a device
+reset, so the stick mounted only about 60 s later. `usb-storage` on the same
+stick reads its capacity about 1.2 s after connection, with no timeout. Linux
+only picks `uas` on a controller that advertises streams, so with them off it
+falls back to `usb-storage` by itself, with no guest configuration.
+
+Unmount a drive on the Mac with `diskutil unmountDisk` rather than Finder's
+**Eject** before handing it over. Eject sends the stick a SCSI stop, and it then
+reports no medium (`[sda] Media removed`) until it is physically replugged.
+
+Neither door is free. `com.apple.vm.device-access` is restricted: Apple grants
+it per developer team, delivers it in a provisioning profile, and DTS describes
+it as meant for virtualization apps shipping on the Mac App Store. Commercial
+virtualization apps carry it, which is why they take a USB drive without
+running as root. Root is not something a desktop app should assume either --
+libusb reads the effective uid of the calling process, so it would be QEMU
+itself running as root, not a small privileged helper alongside it. Which door
+to open is a decision for whoever ships the app. See libusb/libusb#1014.
+
+**Replugging can freeze the window, and a bad exit wedges the device.** Every
+capture attempt goes through libusb's `darwin_reenumerate_device()`, which polls
+an atomic for up to `DARWIN_REENUMERATE_TIMEOUT_US` — 10 seconds — on whichever
+thread called it, and QEMU calls it from the main loop. Unplugging and
+reconnecting the device while the VM runs costs one such timeout per attempt:
+measured on this build, a QEMU-side detach blocked the main loop for 10.08 s,
+and one physical replug stalled the guest's USB enumeration for 29.8 s (guest
+kernel timestamps 34.98 → 64.77). The guest keeps computing, but the window
+stops redrawing and stops accepting input until the timeout expires.
+
+A later retest as root with `streams=off` did not reproduce the freeze: the
+same stick, unmounted in the guest, then unplugged and replugged on the same
+port, came back and remounted within about 5 s, with the window responsive
+throughout. When the timeout is actually hit is not yet pinned down.
+
+A device left behind by an unclean exit stays unusable until it is physically
+reconnected. After QEMU was killed mid-reset, every bulk transfer to the stick
+timed out — from QEMU and from a plain libusb program alike, both running as
+root, with `libusb_claim_interface` still reporting success. One unplug and
+replug restored it, and the same program then completed a SCSI INQUIRY in 20 ms.
+Leave the device plugged in for the life of the VM, and replug it if a run ends
+badly.
+
+The guest needs its own tools for anything beyond enumeration: `usbutils` for
+`lsusb`, `libimobiledevice` for an iPhone.
+
+For scripted launches, `OMARCHY_QEMU_GPU_USB_HOST` overrides the saved choice
+with a raw `usb-host` property list — `vendorid=0x05ac`, or
+`hostbus=1,hostaddr=6` to pin one physical port. The start menu shows when the
+environment owns the choice and leaves its buttons disabled.
+
 ## Networking
 
 Use **Configure…** next to **Networking** on the start menu. **NAT** shares the
@@ -214,6 +371,24 @@ System Settings. Use **Set Up / Repair Networking…** to register it; subsequen
 bridged launches do not request your password. QEMU continues to run as your
 user. **Remove Networking Helper** unregisters the service when it is no longer
 needed. Shut down any bridged VM before repairing or removing the helper.
+
+Persistent VMs keep a stable, randomly generated bridged MAC address across app
+updates, disk replacement, resizing, resets, and moves of the complete VM data
+folder. Existing saved addresses are retained when upgrading from older builds.
+The Networking sheet displays the address after the first bridged launch;
+**Copy MAC** makes it available for a DHCP reservation. **Generate new MAC…**
+shows a proposed address and requires confirmation while the VM is stopped.
+This action saves immediately; DHCP reservations may need updating. Cancelling
+the confirmation leaves the existing identity unchanged.
+
+A copy of the complete VM data folder includes its network identity. To run a
+copy as a separate VM, generate a new MAC before running both copies. Move or
+restore the complete data folder to retain the identity; importing only a disk
+into a new workspace does not transfer its network identity. Ephemeral bridged
+VMs receive a fresh address on each launch. Damaged identity records produce an
+error instead of silently changing the MAC. Migration and regeneration retain
+the preceding record as `network-identities/current.previous.json` in the VM
+data folder; restore a known-good record only with the VM stopped.
 
 For repeated local development builds, use a consistent Apple Development
 signing identity (the `DEVELOPMENT_SIGN_IDENTITY` option above). Ad-hoc-signed
@@ -300,7 +475,17 @@ Loopback binding prevents devices on Wi-Fi, Ethernet, or the wider LAN from
 connecting. It does not isolate the listener from other users or processes on
 the same Mac; guest SSH authentication is still required.
 
+### Touch ID for 1Password
+
+An optional process-scoped integration can use the Mac's Touch ID to unlock
+1Password inside the guest. Existing synced passwords and passkeys stay managed
+by 1Password. See [setup and authorization boundaries](docs/onepassword-touch-id.md).
+
 ### Touch ID for sudo
+
+Guest clock recovery handles time lost during Mac sleep so fresh signed
+approvals remain usable after wake. Existing VMs need the
+[guest clock recovery installer](docs/guest-clock-recovery.md).
 
 The native authentication bridge can enroll this Mac and use
 Touch ID as a sufficient authentication method for guest `sudo`. Open
@@ -326,6 +511,7 @@ no login or screen-unlock PAM policy is changed.
 If Touch ID falls back, sudo displays the reason before asking for the guest
 password. Signed approvals require synchronized Mac and guest clocks; factory
 images enable `systemd-timesyncd` at boot. On an existing guest with clock drift,
+choose **Update and Launch** to install clock recovery and enable time sync, or
 run `sudo systemctl enable --now systemd-timesyncd.service`, then check
 `timedatectl` for `System clock synchronized: yes` before retrying.
 
@@ -355,11 +541,33 @@ boot-time QEMU setting, never part of the guest image or VM data, so switching
 allocations never needs a reset and never touches your files. A stored choice
 that no longer fits the Mac it runs on falls back to the default.
 
+Unused guest memory is automatically returned to macOS through virtio free-page
+reporting. Omarchy still sees the full selected RAM and can use it again when
+needed. Reclamation runs asynchronously and covers genuinely free pages, not
+Linux's file cache or memory still held by applications. For example, selecting
+16 GiB and seeing 12 GiB used does not guarantee exactly 4 GiB returned: cache,
+fragmentation, and VM overhead also affect the Mac's memory usage. Keep enough
+headroom for macOS even with reclamation enabled. Updated apps enable this on the
+next VM launch, including for existing VMs; no disk reset is needed.
+
 Scripted launches can set `OMARCHY_QEMU_GPU_MEMORY_MIB` (a whole number of
 MiB) instead. Scripted launches use the same host-aware default and leave
 at least 4 GiB for macOS for allocations above the 4 GiB baseline. They also
 accept values between menu steps, down to the guest's 2048 MiB minimum. The
 4 GiB baseline remains available on smaller hosts such as CI runners.
+
+## Language
+
+New VMs inherit the Mac's primary language on first boot: English, Traditional
+Chinese (`zh_TW.UTF-8`), or Simplified Chinese (`zh_CN.UTF-8`). Other Mac
+languages currently fall back to English. There is no launcher language setting;
+change the locale inside Omarchy afterward. Later boots and Mac language changes
+do not overwrite that guest choice. Existing VMs keep their saved language.
+
+Applications use translations where available. Omarchy's own setup wizard and
+menus stay in English: upstream has no translation mechanism for those shell
+scripts. The US keyboard layout remains the default input method; fcitx5 also
+includes Chewing (Bopomofo), reachable with `Ctrl + Space`.
 
 ## Requirements
 
@@ -369,11 +577,39 @@ accept values between menu steps, down to the guest's 2048 MiB minimum. The
 
 On M3 and newer Apple Silicon running macOS 26 or newer, Try Omarchy also
 exposes ARM EL2 to Linux, so the guest provides `/dev/kvm` for nested VMs and
-compatible VMMs. macOS 15 and older Apple Silicon Macs automatically keep the
-normal non-nested launch path. macOS 15 remains supported for running Omarchy;
-nested virtualization is disabled there to avoid a QEMU startup crash.
+compatible VMMs. macOS 15 and older Apple Silicon Macs keep the normal
+non-nested launch path. Hardware-accelerated graphics, including Alacritty,
+are available on both macOS 15 and macOS 26.
 
 ## Data and updates
+
+### Check for Mac app updates
+
+The start menu shows the installed Mac app release and **Check for Updates…**;
+the native application menu offers the same command. The update window checks
+the project's latest stable GitHub release and links to its release notes and
+download. Review the release's macOS requirements before installing.
+
+**Automatically check for updates** is on by default; an existing choice to
+disable it is preserved. Opening the app checks at most once every 24 hours.
+A newer release changes the start menu link to **Update Available…** and shows
+a **Download / Skip** dialog when the launcher or settings are ready. It waits
+while you use the guest or another dialog. **Download** opens the GitHub release
+page; **Skip** hides reminders for that version. Each release is announced only
+once, and the update link and manual checks remain available at any time.
+Checks contact GitHub without a GitHub account, and failures do not block VM
+startup. This feature does not download or install app updates automatically.
+
+Older app bundles used the same version metadata for different releases. If
+the build does not include a matching release tag in its metadata, the window
+reports an unknown installed release or a development build instead of claiming
+that it is up to date. The latest release and manual download remain available.
+
+To upgrade, shut down Omarchy, quit the app, download the new DMG, and replace
+**Try Omarchy** in **Applications**. Reopen it to use your existing VM. You do
+not need to reset or delete the VM to update the Mac app.
+
+### Existing VM data
 
 Normal launches keep one persistent VM under
 `~/Library/Application Support/Try Omarchy/VM/v1`. Removing or updating the app
@@ -395,6 +631,18 @@ launch keeps its log with the rest of its temporary state and discards it on
 exit. The log holds whatever the guest prints to its console, so treat it as
 guest data and review it before attaching it to a bug report.
 
+If QEMU crashes in `hv_vm_map` or `hv_vm_unmap`, a trace of the VM's memory
+mappings shows which range failed. Quit Try Omarchy, then launch from Terminal
+with an absolute log path:
+
+```sh
+OMARCHY_QEMU_GPU_HVF_TRACE_LOG="$HOME/Desktop/hvf-trace.log" \
+  "/Applications/Try Omarchy.app/Contents/Resources/scripts/run-qemu-gpu.sh"
+```
+
+The log holds memory addresses and sizes, no guest data. Attach its last few
+hundred lines with the crash report.
+
 VMs created before paired boot files were introduced are preserved too. On the
 first launch that needs them, Try Omarchy explains the transition in a
 **Continue** / **Cancel** dialog before starting recovery. Continue performs a
@@ -413,6 +661,72 @@ local repository. Installing a newer Try Omarchy app therefore does not apply
 all of that app's factory-image changes to an existing VM, and an in-guest
 update should not be assumed to reproduce them. A confirmed reset is the
 deliberate, destructive way to start again from the newest bundled factory.
+Reset deletes the saved VM; the next launch prepares its replacement. Launch
+shows image preparation and verification progress when a new disk is needed,
+then startup progress.
+
+### Updating integrations in an existing VM
+
+On the first app open with an existing disk that has no result for the current
+fix bundle, the launcher's bottom button is **Update**. A matching check that
+found unfinished repairs also offers **Update**. Review the fixes and choose **Update and Launch**; the app runs the
+supported repairs before login and retains their results in Settings. Successful
+checks and updates finish without another dialog. No preliminary boot is needed;
+Skip Launcher shows the launcher for that first review. **Skip** requires a
+second confirmation. Each disk and fix bundle shows the automatic review once;
+skipped or failed fixes remain available through the launcher's **Update** action
+after shutting down the VM. They do not interrupt subsequent automatic launches.
+No terminal commands, SSH, or personal folder sharing are
+needed for normal migration.
+
+This covers the supported clipboard/screensaver fixes, Alacritty cleanup,
+power/menu plugins, clock recovery, compatibility holds, missing lock-screen
+password policy, pinch input, integration setup, and eligible Mac battery
+installation/update. Battery builds use the existing kernel and installed tools;
+missing prerequisites are skipped. No packages or kernel are upgraded.
+
+Touch ID pairing and first-time 1Password enablement remain explicit choices.
+Existing custom files and enrolled older authentication protocols are preserved.
+The guest guide remains under **Setup → Try Omarchy Integrations** for opt-in
+setup or manual review. See [integration updates](docs/integration-updates.md)
+for the command inventory, results, and recovery boundaries.
+
+### Repairing update holds in an older guest
+
+Older guests may fail Omarchy Update with conflicting `libaquamarine.so` or
+`libhyprtoolkit.so` dependencies. New factory images hold the compatible
+Hyprland, aquamarine, Hyprtoolkit, and `hyprland-guiutils` packages together,
+along with the direct-boot kernel and headers. Choose **Update and Launch** to repair missing holds automatically without
+changing package versions. The manual repair below remains available for
+diagnostics and custom maintenance.
+
+Copy `guest/scripts/repair-update-holds.py` from this source checkout into the
+guest, then run it **inside Omarchy**, with the updater closed:
+
+```sh
+python3 repair-update-holds.py          # preview only
+sudo python3 repair-update-holds.py --apply
+```
+
+The command adds missing holds to both `/usr/share/try-omarchy/pacman.conf`
+and `/etc/pacman.conf`. The first file is essential: Omarchy's pre-refresh
+hook restores it over the second before updating. Existing holds, comments,
+repository definitions, and unrelated settings are retained in each file.
+Keep any custom settings you want to survive an update in the saved share
+copy too; the existing update hook still replaces the active configuration.
+
+The repair prints a backup directory under
+`/var/lib/try-omarchy/update-holds-backup.*`, preserving both original files
+under their relative paths. To undo it, close the updater and restore each
+backup to its original location with `sudo cp -p`. Running the repair again
+makes no changes when the holds are already present. It refuses to write
+while pacman has a transaction lock.
+
+Then retry **Update → Omarchy**. This command only repairs the hold list; it
+does not install, downgrade, or upgrade packages, and cannot repair packages
+that were already upgraded into an incompatible combination. If dependency
+errors remain, retain the full error output for diagnosis instead of removing
+the kernel or compositor holds.
 
 ### Growing an existing VM disk
 
@@ -491,6 +805,10 @@ you choose — it never creates a folder inside it on your behalf.
 - A running Docker-compatible engine that supports privileged `linux/arm64`
   containers
 - Roughly 20 GB free for guest, runtime, caches, and assembled output
+- Enough memory for the Linux builder as well as macOS. Hyprland compilation
+  automatically limits parallel jobs to the detected memory budget; see the
+  [guest build memory guidance](guest/README.md) for overrides and a measured
+  configuration on a 16 GiB Mac.
 
 Install the one Homebrew build tool with:
 
@@ -499,8 +817,8 @@ brew install pkg-config
 ```
 
 `make doctor` performs the basic preflight. `make runtime` downloads a
-checksum-pinned `arm64_sequoia` dependency set, builds QEMU and patched libslirp for macOS 15.0,
-and rejects any runtime image that raises that minimum or strongly imports an
+checksum-pinned dependency set, builds QEMU, patched libslirp, and patched VirGL
+for macOS 15.0, and rejects any runtime image that raises that minimum or strongly imports an
 API unavailable on the declared platform. Installed Homebrew library versions
 are never copied into the app.
 
@@ -526,6 +844,17 @@ The generated app lives under `dist/app.noindex/`. macOS can run and package
 the bundle normally, but Spotlight will not present it beside an installed
 copy as a second, indistinguishable Command-Space result. The first app rebuild
 after this layout change removes the old generated bundle from `dist/`.
+
+Local builds use a separate **Try Omarchy Dev** privacy identity and automatically
+select an installed Apple Development signing certificate, falling back to
+Developer ID Application. Grant Accessibility, Camera, and Microphone once for
+development; those decisions can then survive rebuilds with the same signing
+identity. `make package` and `make release` keep the production identity and its
+separate permission flow, and write the app to `dist/release.noindex/`.
+If several certificates are available, set `DEVELOPMENT_SIGN_IDENTITY` to the
+one you want. Without a certificate, local builds stop with setup instructions.
+Use `DEVELOPMENT_SIGN_IDENTITY=-` for intentional ad-hoc builds, which still
+require renewed grants after rebuilds.
 
 Launching also ensures that the guest, runtime, and native app are current, so
 the normal follow-up command is:
@@ -573,9 +902,11 @@ All generated output has one predictable home:
 ```text
 dist/
 ├── app.noindex/
-│   └── Try Omarchy.app
-├── TryOmarchy.dmg        # after make package or make release
-└── guest/                # verified guest build artifacts
+│   └── Try Omarchy.app     # development identity
+├── release.noindex/
+│   └── Try Omarchy.app     # production identity
+├── TryOmarchy.dmg         # after make package or make release
+└── guest/                 # verified guest build artifacts
 ```
 
 Both DMG targets create distributable artifacts:
@@ -585,8 +916,12 @@ Both DMG targets create distributable artifacts:
   `PACKAGE_SIGN_IDENTITY` and `PACKAGE_NOTARY_PROFILE`, which default to the
   configured release credentials, and fails instead of producing an
   unnotarized fallback.
-- `make release` performs the same signing and notarization workflow with the
+- `make release` offers patch, minor, or major selection and direct version
+  entry, builds guest and runtime artifacts when needed, creates an annotated
+  local release tag, and performs the same signing and notarization workflow with the
   release-specific credential variables.
+  Use `make release VERSION=vX.Y.Z` to choose the version without prompting.
+  GitHub publishing remains manual.
 
 Maintainers should follow [`docs/releasing.md`](docs/releasing.md) for the full build, test, signing, license, corresponding-source, and verification checklist.
 
@@ -613,6 +948,6 @@ Try Omarchy is pre-1.0 and under active development. Omarchy and bundled depende
 
 Report ordinary bugs through [GitHub Issues](https://github.com/omacom/try-omarchy/issues). Report suspected vulnerabilities using the private process in [`SECURITY.md`](SECURITY.md), not a public issue.
 
-Try Omarchy's original code is licensed under the [MIT License](LICENSE).
+## License
 
-by [@martiano](https://x.com/martiano)
+[MIT](LICENSE) - Created by [Eduardo Martinez](https://x.com/martiano)

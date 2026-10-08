@@ -43,6 +43,10 @@ case ${1:-} in
 esac
 (( $# <= 1 )) || usage
 
+if ((reset_only == 0)); then
+  echo '[qemu-gpu] Launch phase: checking' >&2
+fi
+
 script_dir=$(cd "$(dirname "$0")" && pwd -P)
 resources_dir=$(cd "$script_dir/.." && pwd -P)
 contents_dir=$(cd "$resources_dir/.." && pwd -P)
@@ -55,6 +59,9 @@ port_forwarding_library="$script_dir/qemu-port-forwarding.sh"
 
 [[ $(uname -m) == arm64 ]] || fail "requires an ARM64 Mac"
 [[ $(uname -s) == Darwin ]] || fail "requires macOS"
+macos_major=$(sw_vers -productVersion | cut -d. -f1)
+[[ $macos_major =~ ^[0-9]+$ ]] && (( macos_major >= 15 )) || \
+  fail "requires macOS 15 or newer"
 [[ -d $guest_input && ! -L $guest_input ]] || fail "ARM guest directory is missing or unsafe: $guest_input"
 guest_dir=$(cd "$guest_input" && pwd -P)
 
@@ -78,7 +85,7 @@ esac
 [[ -f $native_bridge && -x $native_bridge ]] || {
   fail "missing bundled native bridge at $native_bridge"
 }
-file "$qemu_bin" | grep -q 'arm64' || fail "staged QEMU is not an ARM64 executable"
+file "$qemu_bin" | grep 'arm64' >/dev/null || fail "staged QEMU is not an ARM64 executable"
 LC_ALL=C grep -aFq 'TryOmarchy.icns' "$qemu_bin" || {
   fail "staged QEMU lacks the Try Omarchy macOS identity; run make runtime"
 }
@@ -90,46 +97,63 @@ for marker in \
     fail "staged QEMU lacks persistent host audio routing; run make runtime"
   }
 done
-file "$native_bridge" | grep -q 'arm64' || fail "native bridge is not an ARM64 executable"
+file "$native_bridge" | grep 'arm64' >/dev/null || fail "native bridge is not an ARM64 executable"
 codesign --verify --strict "$native_bridge" >/dev/null 2>&1 || {
   fail "native bridge is not code-signed"
 }
 
+# Search captured help directly: grep -q may close a pipe early and make
+# its producer fail with SIGPIPE under pipefail, even when the match succeeds.
 qemu_accels=$("$qemu_bin" -accel help 2>&1) || fail "cannot inspect staged QEMU accelerators"
-printf '%s\n' "$qemu_accels" | grep -qx 'hvf' || fail "staged QEMU does not support HVF"
+grep -qx 'hvf' <<<"$qemu_accels" || fail "staged QEMU does not support HVF"
 qemu_machines=$("$qemu_bin" -machine help 2>&1) || fail "cannot inspect staged QEMU machines"
-printf '%s\n' "$qemu_machines" | grep -Eq '^virt[[:space:]]' || fail "staged QEMU does not provide the ARM virt machine"
+grep -Eq '^virt[[:space:]]' <<<"$qemu_machines" || fail "staged QEMU does not provide the ARM virt machine"
 qemu_cpus=$("$qemu_bin" -cpu help 2>&1) || fail "cannot inspect staged QEMU CPUs"
-printf '%s\n' "$qemu_cpus" | grep -Eq '^[[:space:]]*host([[:space:]]|$)' || fail "staged QEMU does not expose the host CPU"
+grep -Eq '^[[:space:]]*host([[:space:]]|$)' <<<"$qemu_cpus" || fail "staged QEMU does not expose the host CPU"
 qemu_displays=$("$qemu_bin" -display help 2>&1) || fail "cannot inspect staged QEMU displays"
-printf '%s\n' "$qemu_displays" | grep -qx 'cocoa' || fail "staged QEMU does not provide the Cocoa display"
+grep -qx 'cocoa' <<<"$qemu_displays" || fail "staged QEMU does not provide the Cocoa display"
 qemu_devices=$("$qemu_bin" -device help 2>&1) || fail "cannot inspect staged QEMU devices"
 qemu_help=$("$qemu_bin" -help 2>&1) || fail "cannot inspect staged QEMU options"
-printf '%s\n' "$qemu_help" | grep -q -- '^-add-fd fd=fd,set=set' || {
+grep -q -- '^-add-fd fd=fd,set=set' <<<"$qemu_help" || {
   fail "staged QEMU cannot preserve the persistent-disk lock descriptor"
 }
-printf '%s\n' "$qemu_help" | grep -Fq -- '-action reboot=reset|shutdown' || {
+grep -Fq -- '-action reboot=reset|shutdown' <<<"$qemu_help" || {
   fail "staged QEMU cannot apply the required reboot policy"
 }
-printf '%s\n' "$qemu_help" | grep -Fq -- '-action shutdown=poweroff|pause' || {
+grep -Fq -- '-action shutdown=poweroff|pause' <<<"$qemu_help" || {
   fail "staged QEMU cannot apply the required shutdown policy"
 }
-printf '%s\n' "$qemu_help" | grep -Fq 'full-grab=on|off' || {
+grep -Fq 'full-grab=on|off' <<<"$qemu_help" || {
   fail "staged QEMU cannot capture macOS system key combinations"
 }
-printf '%s\n' "$qemu_help" | grep -Fq 'immersive=on|off' || {
+grep -Fq 'immersive=on|off' <<<"$qemu_help" || {
   fail "staged QEMU cannot select its fullscreen presentation"
 }
 qemu_netdevs=$("$qemu_bin" -machine virt -netdev help 2>&1) || {
   fail "cannot inspect staged QEMU network backends"
 }
-printf '%s\n' "$qemu_netdevs" | grep -qx 'user' || {
+grep -qx 'user' <<<"$qemu_netdevs" || {
   fail "staged QEMU does not provide no-root SLIRP networking; run make runtime"
 }
+# Match each mixer to its effective SDL route at launch. The native helper uses
+# the same direction-aware SDL names as the audio picker, including duplicate
+# suffixes, and falls back to that direction's default if a device disappeared.
+# Rates remain fixed for this VM session; changing routes may require a restart.
+host_audio_frequency() {
+  local audio_rate
+  audio_rate=$("$native_bridge" --host-audio-frequency "$1" "$2" 2>/dev/null) || return 1
+  [[ $audio_rate =~ ^[1-9][0-9]{3,5}$ ]] || return 1
+  printf '%s\n' "$audio_rate"
+}
+
+# Keep optional hardware-query failures non-fatal, independently by direction.
+audio_output_frequency=$(host_audio_frequency output "${OMARCHY_SDL_OUTPUT_DEVICE_NAME:-}") || audio_output_frequency=48000
+audio_input_frequency=$(host_audio_frequency input "${OMARCHY_SDL_INPUT_DEVICE_NAME:-}") || audio_input_frequency=48000
+
 qemu_audiodevs=$("$qemu_bin" -machine virt -audiodev help 2>&1) || {
   fail "cannot inspect staged QEMU audio backends"
 }
-printf '%s\n' "$qemu_audiodevs" | grep -qx 'sdl' || {
+grep -qx 'sdl' <<<"$qemu_audiodevs" || {
   fail "staged QEMU does not provide duplex SDL audio; run make runtime"
 }
 
@@ -155,6 +179,24 @@ for device in \
   virtio-pinch-pci; do
   require_qemu_device "$device"
 done
+
+# Experimental opt-in host USB passthrough. Unset keeps every launch on the
+# exact device set below; a value is forwarded verbatim as usb-host properties,
+# either a device class (vendorid=0x05ac) or one exact host port
+# (hostbus=1,hostaddr=6). Anything else is refused rather than reinterpreted as
+# further QEMU options.
+usb_host_properties=${OMARCHY_QEMU_GPU_USB_HOST:-}
+if [[ -n $usb_host_properties ]]; then
+  [[ $usb_host_properties =~ ^[a-z]+=[0-9A-Fa-fx.]+(,[a-z]+=[0-9A-Fa-fx.]+)*$ ]] || {
+    fail "OMARCHY_QEMU_GPU_USB_HOST must be usb-host properties, for example vendorid=0x05ac"
+  }
+  require_qemu_device qemu-xhci
+  require_qemu_device usb-host
+  # Unpatched QEMU reads hostbus=0 as "any bus" and could take a twin.
+  LC_ALL=C grep -aFq 'exact bus 0 matching' "$qemu_bin" || {
+    fail "staged QEMU lacks exact USB bus matching; run make runtime"
+  }
+fi
 for marker in guest_owner_uid guest_owner_gid; do
   LC_ALL=C grep -aFq "$marker" "$qemu_bin" || {
     fail "staged QEMU lacks the shared-folder owner mapping; run make runtime"
@@ -165,6 +207,9 @@ for marker in hv_vm_config_set_el2_enabled hv_gic_create; do
     fail "staged QEMU lacks HVF nested virtualization; run make runtime"
   }
 done
+LC_ALL=C grep -aFq 'HVF free-page backing replacement failed' "$qemu_bin" || {
+  fail "staged QEMU lacks macOS memory reclamation; run make runtime"
+}
 
 qemu_entitlements=$(codesign -d --entitlements - "$qemu_bin" 2>&1) || {
   fail "staged QEMU is not code-signed for HVF"
@@ -368,6 +413,7 @@ runtime = exact_keys(
     {
         "audio",
         "authentication",
+        "battery",
         "camera",
         "clipboard",
         "compressedDisk",
@@ -438,8 +484,11 @@ graphics = {
     "device": "virtio-gpu-gl-pci",
     "display": "cocoa",
     "guestRenderer": "virgl",
-    "hostRenderer": "angle-metal",
+    "hostRenderer": "macos-opengl",
 }
+# Older verified factories use the same virtio/VirGL guest ABI. Their recorded
+# host backend does not constrain the updated app's native OpenGL display.
+legacy_graphics = dict(graphics, hostRenderer="angle-metal")
 network = {
     "device": "virtio-net-pci",
     "backend": "slirp",
@@ -477,6 +526,14 @@ camera = {
     "protocolVersion": 1,
     "width": 1280,
 }
+battery = {
+    "activation": "always-on",
+    "device": "virtserialport",
+    "direction": "host-to-guest",
+    "guestSupplies": ["ADP0", "BAT0"],
+    "port": "dev.tryomarchy.battery",
+    "protocolVersion": 1,
+}
 storage = {
     "device": "virtio-blk-pci",
     "format": "raw",
@@ -494,10 +551,11 @@ if (
     or runtime.get("compressedDisk") != "rootfs.ext4.zst"
     or runtime.get("virtualMachineMonitor") != "qemu-system-aarch64"
     or runtime.get("hypervisor") != "hvf"
-    or runtime.get("graphics") != graphics
+    or runtime.get("graphics") not in (graphics, legacy_graphics)
     or runtime.get("network") != network
     or runtime.get("audio") != audio
     or runtime.get("camera") != camera
+    or runtime.get("battery") != battery
     or runtime.get("storage") != storage
     or runtime.get("clipboard") != clipboard
     or runtime.get("authentication") != authentication
@@ -527,14 +585,14 @@ if (
     fail("upstream identity is not pinned")
 
 supply_chain_keys = {
-    "aquamarine",
-    "hyprtoolkit",
+    "ghostty",
     "archLinuxArmPackagesCommit",
     "archLinuxArmPackagesRepository",
     "hyprland",
     "mise",
     "omarchyPackagesCommit",
     "omarchyPackagesRepository",
+    "tryOmarchyBattery",
     "ttfx",
     "vivaldi",
     "voxtype",
@@ -584,6 +642,7 @@ exact_keys(
         "glibc",
         "hyprland",
         "hyprland-protocols",
+        "hyprwayland-scanner",
         "make",
         "meson",
         "ninja",
@@ -595,58 +654,8 @@ exact_keys(
 hyprland_identity = hashlib.sha256(
     json.dumps(hyprland, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
 ).hexdigest()
-if hyprland_identity != "ae82ce3f989eff555f1faa2400ff0ecb3d7b52b4797c6e3f4fca29959e5a7790":
+if hyprland_identity != "b89f798d6d872313918628dd4c26b37a8fe8d12d8950bd7b25150e29f96800b3":
     fail("factory Hyprland component is not the reviewed rounded-border build")
-aquamarine = exact_keys(
-    supply_chain.get("aquamarine"),
-    {
-        "binarySha256",
-        "license",
-        "packagingCommit",
-        "packagingRepository",
-        "pkgbuild",
-        "pkgbuildSha256",
-        "pkgrel",
-        "repository",
-        "sha256",
-        "url",
-        "version",
-    },
-    "build spec aquamarine component",
-)
-if aquamarine != {
-    "version": "0.14.0",
-    "pkgrel": "2",
-    "repository": "https://github.com/hyprwm/aquamarine",
-    "url": "https://github.com/hyprwm/aquamarine/archive/v0.14.0/aquamarine-0.14.0.tar.gz",
-    "sha256": "5dcf0b17f7dd51539fd7e79d68484f04240b3b63cf9f5f21d5b6dea0088168f9",
-    "pkgbuild": "pinned-packages/aquamarine/PKGBUILD",
-    "pkgbuildSha256": "1bd4197238a4f0092216ab2dfd723126d618cceb977d45865e140a488a8f56ff",
-    "packagingRepository": "https://gitlab.archlinux.org/archlinux/packaging/packages/aquamarine.git",
-    "packagingCommit": "8489a8358817a964a923f05ba324996378d81a5d",
-    "license": "BSD-3-Clause",
-    "binarySha256": "7da003aa60e008e9f514c312f01c1e967983e2c46732d58953735bfaee3fd8aa",
-}:
-    fail("factory aquamarine component is not the reviewed libaquamarine.so=13 rebuild")
-hyprtoolkit = exact_keys(
-    supply_chain.get("hyprtoolkit"),
-    set(aquamarine),
-    "build spec hyprtoolkit component",
-)
-if hyprtoolkit != {
-    "version": "0.5.4",
-    "pkgrel": "6.1",
-    "repository": "https://github.com/hyprwm/hyprtoolkit",
-    "url": "https://github.com/hyprwm/hyprtoolkit/archive/v0.5.4/hyprtoolkit-0.5.4.tar.gz",
-    "sha256": "2fb59789f231c1c4e9154ceffc1e7524c0cae154807c0d57e6166806255b570f",
-    "pkgbuild": "pinned-packages/hyprtoolkit/PKGBUILD",
-    "pkgbuildSha256": "803f1db19ad1d42e48b638e35256d3dabbe19d1d0b4b3fd584eedf20121256ce",
-    "packagingRepository": "https://gitlab.archlinux.org/archlinux/packaging/packages/hyprtoolkit.git",
-    "packagingCommit": "1ed230388a2ccb2c857af980235cf25a4f86e39e",
-    "license": "BSD-3-Clause",
-    "binarySha256": "dc814fad9723bfcf66dbd29b7f8c5cc96fd63a1ff623909e466dd9d011c0cba8"
-}:
-    fail("factory hyprtoolkit component is not the reviewed libaquamarine.so=13 rebuild")
 mise = exact_keys(
     supply_chain.get("mise"),
     {"binarySha256", "license", "reportedVersion", "sha256", "url", "version"},
@@ -731,6 +740,41 @@ if yay != {
     "licenseSha256": "589ed823e9a84c56feb95ac58e7cf384626b9cbf4fda2a907bc36e103de1bad2",
 }:
     fail("factory yay component is not the reviewed ARM64 release")
+ghostty = exact_keys(
+    supply_chain.get("ghostty"),
+    {
+        "license",
+        "pkgrel",
+        "recipe",
+        "recipeSha256",
+        "signatureSha256",
+        "signingKey",
+        "sourceSha256",
+        "sourceUrl",
+        "version",
+        "wrapperSha256",
+        "zigSha256",
+        "zigUrl",
+        "zigVersion",
+    },
+    "build spec Ghostty component",
+)
+if ghostty != {
+    "version": "1.3.1",
+    "pkgrel": "2",
+    "sourceUrl": "https://release.files.ghostty.org/1.3.1/ghostty-1.3.1.tar.gz",
+    "sourceSha256": "3349d25600ffbda281197a18314f7d18791969cffe9474f0ff16a45a9ebfccdb",
+    "signingKey": "RWQlAjJC23149WL2sEpT/l0QKy7hMIFhYdQOFy0Z7z7PbneUgvlsnYcV",
+    "zigVersion": "0.15.2",
+    "zigUrl": "https://ziglang.org/download/0.15.2/zig-aarch64-linux-0.15.2.tar.xz",
+    "zigSha256": "958ed7d1e00d0ea76590d27666efbf7a932281b3d7ba0c6b01b0ff26498f667f",
+    "recipe": "native-overlay/usr/local/share/try-omarchy/ghostty/PKGBUILD",
+    "recipeSha256": "039101852ca314042c7a28892554418ca7f067a174c4dea3bdc453182bbde28c",
+    "wrapperSha256": "c41b20e46f257da7a06ee8c67b1056d099f61d7935ac2014525b1b2b1f74f827",
+    "license": "MIT",
+    "signatureSha256": "5591816f6a52f03d1ea5be0129fcc396aeece7238419cdd36e511546ee242798"
+}:
+    fail("Ghostty installer is not pinned to the reviewed signed ARM64 source build")
 vivaldi = exact_keys(
     supply_chain.get("vivaldi"),
     {
@@ -807,12 +851,16 @@ arguments = command_line.split(" ")
 for required in ("root=/dev/vda", "rw", "rootwait", "console=tty0", "console=hvc0"):
     if arguments.count(required) != 1:
         fail(f"kernel command line must contain exactly one {required}")
+if any(argument.startswith("omarchy.virgl_dual_source=") for argument in arguments):
+    fail("kernel command line contains a launcher-owned VirGL capability argument")
 if any(argument.startswith("omarchy.qemu_virgl=") for argument in arguments):
     fail("kernel command line already contains a QEMU VirGL role")
 if any(argument.startswith("omarchy.shared_folder_name=") for argument in arguments):
     fail("kernel command line already contains a shared folder name")
 if any(argument.startswith("tryomarchy.ssh_access=") for argument in arguments):
     fail("kernel command line contains a launcher-owned SSH activation argument")
+if any(argument.startswith("tryomarchy.keyboard=") for argument in arguments):
+    fail("kernel command line contains a launcher-owned keyboard geometry argument")
 
 records = manifest.get("artifacts")
 if not isinstance(records, list) or len(records) != len(expected_artifacts):
@@ -916,8 +964,14 @@ IFS=$'\t' read -r bundle_identity source_disk_sha source_disk_bytes compressed_d
 (( expanded_disk_bytes >= source_disk_bytes )) || fail "working disk cannot be smaller than its source"
 [[ -n $kernel_command_line ]] || fail "validated kernel command line is empty"
 case " $kernel_command_line " in
+  *' omarchy.virgl_dual_source='*)
+    fail "validated kernel command line contains a launcher-owned VirGL capability argument"
+    ;;
   *' tryomarchy.ssh_access='*)
     fail "validated kernel command line contains a launcher-owned SSH activation argument"
+    ;;
+  *' tryomarchy.keyboard='*)
+    fail "validated kernel command line contains a launcher-owned keyboard geometry argument"
     ;;
 esac
 if [[ ${OMARCHY_QEMU_GPU_INSPECT_ONLY:-0} == 1 ]]; then
@@ -937,12 +991,13 @@ fi
 # a build-time path and exits without sourcing any shell library.
 # shellcheck source=qemu-persistent-storage.sh
 source "$storage_library"
+QEMU_PERSISTENT_STORAGE_HELPER=$native_bridge
 # shellcheck source=qemu-port-forwarding.sh
 source "$port_forwarding_library"
 source "$script_dir/qemu-networking.sh"
 qemu_network_validate
 if [[ $QEMU_NETWORK_MODE == bridged ]]; then
-  printf '%s\n' "$qemu_netdevs" | grep -qx stream || fail 'The bundled QEMU does not support bridged networking. Rebuild the runtime.'
+  grep -qx stream <<<"$qemu_netdevs" || fail 'The bundled QEMU does not support bridged networking. Rebuild the runtime.'
 fi
 
 network_forwards=${OMARCHY_QEMU_GPU_PORT_FORWARDS:-}
@@ -960,6 +1015,23 @@ if [[ $QEMU_NETWORK_MODE == bridged && $QEMU_NETWORK_SSH == 1 ]]; then
   ssh_kernel_argument=' tryomarchy.ssh_access=1'
 fi
 
+keyboard_kernel_argument=""
+if ((reset_only)); then
+  unset TRYOMARCHY_KEYBOARD
+else
+  host_keyboard_geometry=$("$native_bridge" --host-keyboard-geometry) || {
+    fail "cannot detect the host Mac keyboard geometry"
+  }
+  case "$host_keyboard_geometry" in
+    ansi|iso|jis) ;;
+    *)
+      fail "host Mac keyboard geometry is invalid: $host_keyboard_geometry"
+      ;;
+  esac
+  keyboard_kernel_argument=" tryomarchy.keyboard=$host_keyboard_geometry"
+  export TRYOMARCHY_KEYBOARD=$host_keyboard_geometry
+fi
+
 host_cpu_count=$(
   sysctl -n hw.logicalcpu 2>/dev/null ||
     sysctl -n hw.ncpu 2>/dev/null ||
@@ -973,6 +1045,16 @@ default_vcpu_count=8
 if (( host_cpu_count < default_vcpu_count )); then
   default_vcpu_count=$host_cpu_count
 fi
+# Capacity is independent of the signed factory metrics. Validate before any
+# workspace mutation; a blank setting preserves existing/factory capacity.
+disk_capacity_gib=${OMARCHY_QEMU_GPU_DISK_GIB:-}
+disk_capacity_bytes=''
+if [[ -n $disk_capacity_gib ]]; then
+  [[ $disk_capacity_gib =~ ^[1-9][0-9]{0,3}$ ]] && (( disk_capacity_gib <= 8192 )) || \
+    fail "OMARCHY_QEMU_GPU_DISK_GIB must be a whole number from 1 to 8192"
+  disk_capacity_bytes=$((disk_capacity_gib * 1024 * 1024 * 1024))
+fi
+
 vcpu_count=${OMARCHY_QEMU_GPU_CPUS-$default_vcpu_count}
 # Bound and validate decimal text before shell arithmetic: reject expressions,
 # leading zeroes (octal), and values that could wrap a signed integer.
@@ -1064,16 +1146,35 @@ if [[ -n $shared_folder ]]; then
   shared_folder_kernel_argument=" omarchy.shared_folder_name=$shared_folder_name_encoded"
 fi
 
+# The native app supplies the Mac's primary language for first-boot seeding.
+# Validate direct script callers against the factory-generated locales too.
+guest_locale=${OMARCHY_QEMU_GPU_LOCALE:-}
+locale_kernel_argument=""
+if [[ -n $guest_locale ]]; then
+  case $guest_locale in
+    en_US.UTF-8 | zh_TW.UTF-8 | zh_CN.UTF-8)
+      locale_kernel_argument=" tryomarchy.locale=$guest_locale"
+      ;;
+    *)
+      fail "unsupported guest locale: $guest_locale"
+      ;;
+  esac
+fi
+
 work_dir=""
 owner_marker=""
 owner_token=""
 qemu_pid=""
 command_bridge_pid=""
+monitor_ready_pid=""
 audio_bridge_pid=""
 authentication_bridge_pid=""
 camera_bridge_pid=""
+battery_bridge_pid=""
+timezone_bridge_pid=""
 clipboard_bridge_pid=""
 network_link_bridge_pid=""
+integration_bridge_pid=""
 
 terminate_child() {
   local pid=$1
@@ -1098,11 +1199,17 @@ cleanup() {
   local status=$?
   trap - EXIT HUP INT TERM
   set +e
+  if [[ $monitor_ready_pid =~ ^[0-9]+$ ]]; then
+    terminate_child "$monitor_ready_pid" 20
+  fi
   if [[ $network_link_bridge_pid =~ ^[0-9]+$ ]]; then
     terminate_child "$network_link_bridge_pid" 20
   fi
   if [[ $command_bridge_pid =~ ^[0-9]+$ ]]; then
     terminate_child "$command_bridge_pid" 20
+  fi
+  if [[ $integration_bridge_pid =~ ^[0-9]+$ ]]; then
+    terminate_child "$integration_bridge_pid" 20
   fi
   if [[ $qemu_pid =~ ^[0-9]+$ ]]; then
     terminate_child "$qemu_pid" 40
@@ -1115,6 +1222,12 @@ cleanup() {
   fi
   if [[ $camera_bridge_pid =~ ^[0-9]+$ ]]; then
     terminate_child "$camera_bridge_pid" 20
+  fi
+  if [[ $battery_bridge_pid =~ ^[0-9]+$ ]]; then
+    terminate_child "$battery_bridge_pid" 20
+  fi
+  if [[ $timezone_bridge_pid =~ ^[0-9]+$ ]]; then
+    terminate_child "$timezone_bridge_pid" 20
   fi
   if [[ $clipboard_bridge_pid =~ ^[0-9]+$ ]]; then
     terminate_child "$clipboard_bridge_pid" 20
@@ -1176,17 +1289,32 @@ reap_stale_work_dirs() {
     launcher_command=$(printf '%s\n' "$process_snapshot" | awk -v pid="$launcher_pid" '$1 == pid { $1=""; print }')
     [[ $launcher_command != *"run-qemu-gpu.sh"* ]] || continue
 
+    stale_qemu_pid=""
     qemu_marker="$candidate/.qemu.pid"
     if [[ -f $qemu_marker && ! -L $qemu_marker ]]; then
       stale_qemu_pid=$(<"$qemu_marker")
-      if [[ $stale_qemu_pid =~ ^[0-9]+$ ]]; then
-        qemu_command=$(printf '%s\n' "$process_snapshot" | awk -v pid="$stale_qemu_pid" '$1 == pid { $1=""; print }')
-        if [[ $qemu_command == *"$qemu_bin"* &&
-              $qemu_command == *"unix:/tmp/${candidate##*/}/qmp.sock"* ]]; then
-          continue
-        fi
+      [[ $stale_qemu_pid =~ ^[0-9]+$ ]] || continue
+      qemu_command=$(printf '%s\n' "$process_snapshot" | awk -v pid="$stale_qemu_pid" '$1 == pid { $1=""; print }')
+      if [[ $qemu_command == *"$qemu_bin"* &&
+            $qemu_command == *"unix:/tmp/${candidate##*/}/qmp.sock"* ]]; then
+        continue
       fi
     fi
+
+    # A failed ps is not evidence that a process exited. Obtain a complete UID
+    # inventory after reading the marker, and prove it contains this launcher.
+    local process_ids="" inspected_pid="" inspection_valid=0 run_is_alive=0
+    if ! process_ids=$(ps -U "$(id -u)" -o pid= 2>/dev/null); then
+      continue
+    fi
+    while read -r inspected_pid; do
+      [[ $inspected_pid =~ ^[0-9]+$ ]] || continue
+      [[ $inspected_pid != "$$" ]] || inspection_valid=1
+      if [[ $inspected_pid == "$launcher_pid" || $inspected_pid == "$stale_qemu_pid" ]]; then
+        run_is_alive=1
+      fi
+    done <<<"$process_ids"
+    (( inspection_valid == 1 && run_is_alive == 0 )) || continue
 
     echo "[qemu-gpu] Removing a verified stale disposable run: $candidate" >&2
     /bin/rm -rf "$candidate"
@@ -1262,29 +1390,32 @@ recover_persistent_boot_kit() {
   recovery_command_line+=' rootflags=noload fsck.mode=skip tryomarchy.export_boot=1'
 
   echo '[qemu-gpu] Pairing the saved VM with its original boot files (one time).' >&2
-  "$qemu_bin" \
-    -name 'Try Omarchy Boot Recovery' \
-    -machine "$qemu_machine" \
-    -cpu 'host,pmu=off' \
-    -smp '2,sockets=1,cores=2,threads=1' \
-    -m 2G \
-    -nodefaults \
-    -no-reboot \
-    -display none \
-    -serial none \
-    -monitor none \
-    -qmp "unix:$qmp_socket,server=on,wait=off" \
-    -kernel "$bundled_kernel" \
-    -initrd "$bundled_initramfs" \
-    -append "$recovery_command_line" \
-    -drive "if=none,id=omarchy-recovery-root,file=$working_disk,format=raw,media=disk,cache=none,readonly=on" \
-    -device 'virtio-blk-pci,drive=omarchy-recovery-root,serial=omarchy-root' \
-    -device 'virtio-serial-pci,id=omarchy-recovery-serial' \
-    -chardev 'stdio,id=omarchy-recovery-hvc0,signal=off' \
-    -device 'virtconsole,bus=omarchy-recovery-serial.0,nr=0,chardev=omarchy-recovery-hvc0' \
-    -fsdev "local,id=omarchy-boot-export,path=$boot_export_dir,security_model=none,multidevs=remap" \
-    -device 'virtio-9p-pci,fsdev=omarchy-boot-export,mount_tag=try-omarchy-boot-export,romfile=' \
-    -add-fd "$QEMU_PERSISTENT_STORAGE_QEMU_ADD_FD" &
+  (
+    unset TRYOMARCHY_KEYBOARD
+    exec "$qemu_bin" \
+      -name 'Try Omarchy Boot Recovery' \
+      -machine "$qemu_machine" \
+      -cpu 'host,pmu=off' \
+      -smp '2,sockets=1,cores=2,threads=1' \
+      -m 2G \
+      -nodefaults \
+      -no-reboot \
+      -display none \
+      -serial none \
+      -monitor none \
+      -qmp "unix:$qmp_socket,server=on,wait=off" \
+      -kernel "$bundled_kernel" \
+      -initrd "$bundled_initramfs" \
+      -append "$recovery_command_line" \
+      -drive "if=none,id=omarchy-recovery-root,file=$working_disk,format=raw,media=disk,cache=none,readonly=on" \
+      -device 'virtio-blk-pci,drive=omarchy-recovery-root,serial=omarchy-root' \
+      -device 'virtio-serial-pci,id=omarchy-recovery-serial' \
+      -chardev 'stdio,id=omarchy-recovery-hvc0,signal=off' \
+      -device 'virtconsole,bus=omarchy-recovery-serial.0,nr=0,chardev=omarchy-recovery-hvc0' \
+      -fsdev "local,id=omarchy-boot-export,path=$boot_export_dir,security_model=none,multidevs=remap" \
+      -device 'virtio-9p-pci,fsdev=omarchy-boot-export,mount_tag=try-omarchy-boot-export,romfile=' \
+      -add-fd "$QEMU_PERSISTENT_STORAGE_QEMU_ADD_FD"
+  ) &
   qemu_pid=$!
   printf '%s\n' "$qemu_pid" >"$work_dir/.qemu.pid" || \
     boot_recovery_fail 'could not record the recovery process'
@@ -1353,6 +1484,12 @@ recover_persistent_boot_kit() {
   echo '[qemu-gpu] Saved VM boot files recovered; continuing normal launch.' >&2
 }
 
+if ((reset_only)); then
+  qemu_persistent_storage_reset "$bundle_identity" || fail 'could not clear the VM disk'
+  echo '[qemu-gpu] Reset complete.' >&2
+  exit 0
+fi
+
 umask 077
 work_dir=$(mktemp -d '/private/tmp/omarchy-qemu-gpu.XXXXXX') || {
   fail "could not create a private temporary directory"
@@ -1375,7 +1512,11 @@ qmp_socket="/tmp/${work_dir##*/}/qmp.sock"
 audio_bridge_socket="/tmp/${work_dir##*/}/audio.sock"
 authentication_bridge_socket="/tmp/${work_dir##*/}/authentication.sock"
 camera_bridge_socket="/tmp/${work_dir##*/}/camera.sock"
+battery_bridge_socket="/tmp/${work_dir##*/}/battery.sock"
+timezone_bridge_socket="/tmp/${work_dir##*/}/timezone.sock"
 clipboard_bridge_socket="/tmp/${work_dir##*/}/clipboard.sock"
+settings_bridge_socket="/tmp/${work_dir##*/}/settings.sock"
+integration_bridge_socket="/tmp/${work_dir##*/}/integrations.sock"
 audio_route_dir="/tmp/${work_dir##*/}/audio-routes"
 mkdir -m 700 "$work_dir/audio-routes"
 
@@ -1399,16 +1540,15 @@ if [[ $storage_mode == persistent ]]; then
 fi
 
 if (( selected_existing == 0 )); then
+  if [[ -n $disk_capacity_bytes ]]; then
+    (( disk_capacity_bytes >= expanded_disk_bytes )) || fail 'maximum disk size is below the factory capacity'
+    expanded_disk_bytes=$disk_capacity_bytes
+  fi
   source_disk="$guest_dir/rootfs.ext4"
+  source_decoder=''
   if [[ ! -e $source_disk && ! -L $source_disk ]]; then
-    qemu_persistent_storage_materialize_source \
-      "$bundle_identity" \
-      "$guest_dir/rootfs.ext4.zst" \
-      "$compressed_disk_bytes" \
-      "$source_disk_sha" \
-      "$source_disk_bytes" \
-      "$resources_dir/runtime/bin/zstd" || fail "could not materialize the bundled root disk"
-    source_disk=$QEMU_IMMUTABLE_SOURCE_DISK
+    source_disk="$guest_dir/rootfs.ext4.zst"
+    source_decoder="$resources_dir/runtime/bin/zstd"
   fi
   if qemu_persistent_storage_select \
     "$storage_mode" \
@@ -1420,7 +1560,8 @@ if (( selected_existing == 0 )); then
     "$expanded_disk_bytes" \
     "$bundled_kernel" \
     "$bundled_initramfs" \
-    "$kernel_command_line"; then
+    "$kernel_command_line" \
+    "$source_decoder"; then
     :
   else
     storage_status=$?
@@ -1453,12 +1594,26 @@ launch_kernel_command_line=$QEMU_SELECTED_KERNEL_COMMAND_LINE
 [[ -n $launch_kernel && -n $launch_initramfs && -n $launch_kernel_command_line ]] || {
   fail 'the selected VM has no complete boot kit'
 }
+case " $launch_kernel_command_line " in
+  *' omarchy.virgl_dual_source='*)
+    fail "selected kernel command line contains a launcher-owned VirGL capability argument"
+    ;;
+esac
 
-if ((reset_only)); then
-  qemu_persistent_storage_release_lock
-  echo "[qemu-gpu] Reset complete." >&2
-  exit 0
+if [[ -n $disk_capacity_bytes && $storage_mode == persistent && ${OMARCHY_QEMU_GPU_DRY_RUN:-0} == 0 ]]; then
+  qemu_persistent_storage_grow_selected "$disk_capacity_bytes" "$native_bridge" || \
+    fail 'could not apply maximum disk size'
 fi
+
+# A saved disk owns its capability. Never apply a newer app's locale to an
+# older guest; mask the legacy every-boot writer so in-guest edits survive.
+case " $launch_kernel_command_line " in
+  *' tryomarchy.locale_support=2 '*) ;;
+  *' tryomarchy.locale_support=1 '*)
+    locale_kernel_argument=" systemd.mask=try-omarchy-locale.service"
+    ;;
+  *) locale_kernel_argument="" ;;
+esac
 
 case ${OMARCHY_QEMU_GPU_IMMERSIVE:-1} in
   1)
@@ -1471,6 +1626,55 @@ case ${OMARCHY_QEMU_GPU_IMMERSIVE:-1} in
     ;;
   *) fail "OMARCHY_QEMU_GPU_IMMERSIVE must be 0 or 1" ;;
 esac
+
+# Diagnostics for HVF memory-mapping crashes: log every HVF map, unmap and
+# protect to this file, so a crash report can be matched to the ranges before it.
+hvf_trace_log=${OMARCHY_QEMU_GPU_HVF_TRACE_LOG:-}
+if [[ -n $hvf_trace_log && $hvf_trace_log != /* ]]; then
+  fail "OMARCHY_QEMU_GPU_HVF_TRACE_LOG must be an absolute path"
+fi
+
+# systemd's boot credential creates one temporary service without replacing
+# the guest's default target or requiring an agent to already be installed.
+settings_payload="$resources_dir/guest-settings"
+[[ -f $settings_payload/guest-settings.service && -f $settings_payload/install.py ]] || \
+  fail "the bundled settings integration is missing"
+settings_unit=$(base64 < "$settings_payload/guest-settings.service" | tr -d '\r\n')
+settings_kernel_argument=" systemd.set_credential_binary=systemd.extra-unit.try-omarchy-settings.service:$settings_unit systemd.wants=try-omarchy-settings.service"
+# Keep the older factory's independent wrapper-retirement unit from bypassing
+# Skip or racing this runner's interrupted-file recovery.
+settings_kernel_argument+=" systemd.mask=try-omarchy-migrate-alacritty.service"
+# Consent is valid only for the exact payload and locked disk reviewed in the
+# app. Direct/older launchers get inspection and interrupted-work recovery only.
+fixes_consent=${OMARCHY_QEMU_GPU_GUEST_FIXES_CONSENT:-}
+if [[ -n $fixes_consent ]]; then
+  fixes_identity=${fixes_consent%:*}
+  fixes_inode=${fixes_consent##*:}
+  [[ $fixes_identity =~ ^[0-9a-f]{64}$ && $fixes_inode =~ ^[0-9]+$ ]] || fail 'invalid guest fixes consent'
+  [[ -f $settings_payload/fixes.json ]] || fail 'guest fixes manifest is missing'
+  bundled_fixes_identity=$(plutil -extract identity raw -o - "$settings_payload/fixes.json") || fail 'invalid guest fixes manifest'
+  [[ $fixes_identity == "$bundled_fixes_identity" && $fixes_inode == "$(stat -f %i "$working_disk")" ]] || fail 'the reviewed VM or fixes changed; review the update again'
+  settings_kernel_argument+=" tryomarchy.fixes=$fixes_identity"
+fi
+# Read the current Mac zone at launch, never from a build-time setting or a
+# saved launcher preference. Reject separators before forming a kernel token.
+host_timezone=$("$native_bridge" --host-timezone) || fail "cannot read the Mac time zone"
+[[ -n $host_timezone && ${#host_timezone} -le 128 ]] || fail "invalid Mac time zone"
+case "$host_timezone" in
+  *[!A-Za-z0-9_+/-]*|/*|*/|*//*|.|..|./*|../*|*/./*|*/../*) fail "invalid Mac time zone" ;;
+esac
+timezone_kernel_argument=" tryomarchy.timezone=$host_timezone"
+# Mask the old disk's mount unit for this boot. The payload service mounts the
+# personal share with the bundled safe helper before installing settings.
+# A payload failure must leave sharing unavailable, never fall back to writeback.
+mac_share_kernel_argument=""
+if [[ -n $shared_folder ]]; then
+  [[ -f $settings_payload/omarchy-native-mac-share ]] || \
+    fail "the bundled shared-folder safety integration is missing"
+  mac_share_kernel_argument=" systemd.mask=omarchy-native-mac-share.service"
+fi
+# QEMU escapes commas in key-value option values by doubling them.
+settings_payload_escaped=${settings_payload//,/,,}
 
 # macOS 15 can pass the paused EL2 probe, then abort with HV_BAD_ARGUMENT when
 # QEMU synchronizes vCPU registers (#211). Keep it on the platform-GIC/EL1 path.
@@ -1524,6 +1728,12 @@ if [[ $QEMU_NETWORK_MODE == bridged ]]; then
   fi
 fi
 
+launch_append="$launch_kernel_command_line omarchy.qemu_virgl=1 omarchy.virgl_dual_source=1$shared_folder_kernel_argument$ssh_kernel_argument$settings_kernel_argument$mac_share_kernel_argument$keyboard_kernel_argument$locale_kernel_argument$timezone_kernel_argument"
+# ARM64 truncates boot arguments at 2048 bytes. Losing the mask or credential
+# could restore the older guest's writeback mount, so refuse that launch.
+launch_append_bytes=$(printf '%s' "$launch_append" | wc -c | tr -d ' ')
+(( launch_append_bytes < 2048 )) || fail "shared-folder safety boot arguments exceed the ARM64 limit"
+
 qemu_args=(
   -name 'Try Omarchy'
   "${qemu_virtualization_args[@]}"
@@ -1537,7 +1747,7 @@ qemu_args=(
   -action 'reboot=reset,shutdown=poweroff'
   -netdev "$qemu_netdev"
   -device "virtio-net-pci,id=omarchy-nic,netdev=omarchy-net,mac=$network_mac,romfile="
-  -audiodev 'sdl,id=omarchy-audio'
+  -audiodev "sdl,id=omarchy-audio,timer-period=1000,out.buffer-count=8,out.frequency=$audio_output_frequency,in.frequency=$audio_input_frequency"
   -device 'intel-hda,id=omarchy-hda,romfile='
   -device 'hda-micro,bus=omarchy-hda.0,audiodev=omarchy-audio'
   -serial none
@@ -1545,7 +1755,7 @@ qemu_args=(
   -qmp "unix:$qmp_socket,server=on,wait=off"
   -kernel "$launch_kernel"
   -initrd "$launch_initramfs"
-  -append "$launch_kernel_command_line omarchy.qemu_virgl=1$shared_folder_kernel_argument$ssh_kernel_argument"
+  -append "$launch_append"
   -drive "if=none,id=omarchy-root,file=$working_disk,format=raw,media=disk,cache=writeback"
   -device 'virtio-blk-pci,drive=omarchy-root,serial=omarchy-root'
   -device "$gpu_device"
@@ -1555,14 +1765,19 @@ qemu_args=(
   # can consume them, while preserving the explicit host shortcuts.
   # Immersive launches Full Screen and hard-hides the Mac menu bar and Dock;
   # otherwise Cocoa opens a centered, resizable window.
-  -display "cocoa,gl=es,show-cursor=on,zoom-to-fit=on,full-screen=$cocoa_full_screen,full-grab=off,immersive=$cocoa_immersive,swap-opt-cmd=off"
+  -display "cocoa,gl=on,show-cursor=on,zoom-to-fit=on,full-screen=$cocoa_full_screen,full-grab=off,immersive=$cocoa_immersive,swap-opt-cmd=off"
   -device 'virtio-keyboard-pci,romfile='
   -device 'virtio-tablet-pci,romfile='
   -device 'virtio-pinch-pci,romfile='
   -object 'rng-random,id=omarchy-rng,filename=/dev/urandom'
   -device 'virtio-rng-pci,rng=omarchy-rng'
-  -device virtio-balloon-pci
+  # Report genuinely free pages without reducing the guest RAM allocation.
+  -device virtio-balloon-pci,free-page-reporting=on
+  -fsdev "local,id=omarchy-settings,path=$settings_payload_escaped,security_model=none,readonly=on"
+  -device 'virtio-9p-pci,fsdev=omarchy-settings,mount_tag=try-omarchy-settings,romfile='
   -device 'virtio-serial-pci,id=omarchy-serial'
+  -chardev "socket,id=omarchy-settings-bridge,path=$settings_bridge_socket,server=on,wait=off"
+  -device 'virtserialport,bus=omarchy-serial.0,nr=6,chardev=omarchy-settings-bridge,name=dev.tryomarchy.settings'
   -chardev "stdio,id=omarchy-hvc0,signal=off,logfile=$console_log_option,logappend=off"
   -device 'virtconsole,bus=omarchy-serial.0,nr=0,chardev=omarchy-hvc0'
   -chardev "socket,id=omarchy-audio-bridge,path=$audio_bridge_socket,server=on,wait=off"
@@ -1573,7 +1788,42 @@ qemu_args=(
   -device 'virtserialport,bus=omarchy-serial.0,nr=3,chardev=omarchy-authentication-bridge,name=dev.tryomarchy.authentication'
   -chardev "socket,id=omarchy-camera-bridge,path=$camera_bridge_socket,server=on,wait=off"
   -device 'virtserialport,bus=omarchy-serial.0,nr=4,chardev=omarchy-camera-bridge,name=dev.tryomarchy.camera'
+  -chardev "socket,id=omarchy-battery-bridge,path=$battery_bridge_socket,server=on,wait=off"
+  -device 'virtserialport,bus=omarchy-serial.0,nr=7,chardev=omarchy-battery-bridge,name=dev.tryomarchy.battery'
+  -chardev "socket,id=omarchy-timezone-bridge,path=$timezone_bridge_socket,server=on,wait=off"
+  -device 'virtserialport,bus=omarchy-serial.0,nr=8,chardev=omarchy-timezone-bridge,name=dev.tryomarchy.timezone'
 )
+
+if [[ -f $resources_dir/integrations/manifest.json ]]; then
+  integration_share_option=${resources_dir//,/,,}/integrations
+  qemu_args+=(
+    -fsdev "local,id=omarchy-updates,path=$integration_share_option,security_model=none,readonly=on"
+    -device 'virtio-9p-pci,fsdev=omarchy-updates,mount_tag=tryomarchy-updates,romfile='
+    -chardev "socket,id=omarchy-integrations,path=$integration_bridge_socket,server=on,wait=off"
+    -device 'virtserialport,bus=omarchy-serial.0,nr=5,chardev=omarchy-integrations,name=dev.tryomarchy.integrations'
+  )
+fi
+
+if [[ -n $hvf_trace_log ]]; then
+  qemu_args+=(
+    -trace hvf_vm_map
+    -trace hvf_vm_unmap
+    -trace hvf_vm_protect
+    -D "$hvf_trace_log"
+  )
+fi
+
+if [[ -n $usb_host_properties ]]; then
+  # One xHCI controller carries the passed-through device. Whether macOS lets
+  # go of a device it drives itself depends on QEMU's privilege, not on these
+  # arguments; the README has the measurements. Streams stay off: bulk streams
+  # never complete through usb-host on macOS, so a guest UAS driver would hang
+  # a drive on its first command. Without them Linux uses usb-storage instead.
+  qemu_args+=(
+    -device 'qemu-xhci,id=omarchy-usb,streams=off'
+    -device "usb-host,bus=omarchy-usb.0,id=omarchy-usb-host,$usb_host_properties"
+  )
+fi
 
 if [[ -n $shared_folder ]]; then
   # security_model=none performs every host operation as this Mac user and
@@ -1611,11 +1861,14 @@ if [[ ${OMARCHY_QEMU_GPU_DRY_RUN:-0} == 1 ]]; then
     "$native_bridge" "$authentication_bridge_socket" >&2
   printf '\n[qemu-gpu] camera bridge command: %q --bridge-native-camera QEMU_PID %q' \
     "$native_bridge" "$camera_bridge_socket" >&2
+  printf '\n[qemu-gpu] battery bridge command: %q --bridge-native-battery QEMU_PID %q' \
+    "$native_bridge" "$battery_bridge_socket" >&2
   if [[ -n $shared_folder ]]; then
     printf '\n[qemu-gpu] shared folder: %q' "$shared_folder" >&2
   else
     printf '\n[qemu-gpu] shared folder: disabled' >&2
   fi
+  printf '\n[qemu-gpu] usb passthrough: %s' "${usb_host_properties:-disabled}" >&2
   printf '\n[qemu-gpu] port forwarding: %s' "$port_forwarding_summary" >&2
   printf '\n' >&2
   exit 0
@@ -1634,13 +1887,14 @@ if [[ -n $shared_folder ]]; then
   echo "[qemu-gpu] Shared folder: $shared_folder (guest ~/$shared_folder_name)" >&2
 fi
 echo "[qemu-gpu] Port forwarding: $port_forwarding_summary" >&2
+echo '[qemu-gpu] Launch phase: starting' >&2
 "$qemu_bin" "${qemu_args[@]}" &
 qemu_pid=$!
 printf '%s\n' "$qemu_pid" >"$work_dir/.qemu.pid"
 chmod 600 "$work_dir/.qemu.pid"
 
 for ((attempt = 0; attempt < 100; attempt++)); do
-  if [[ -S $qmp_socket && -S $audio_bridge_socket && -S $authentication_bridge_socket && -S $camera_bridge_socket && -S $clipboard_bridge_socket ]]; then
+  if [[ -S $qmp_socket && -S $audio_bridge_socket && -S $authentication_bridge_socket && -S $camera_bridge_socket && -S $battery_bridge_socket && -S $timezone_bridge_socket && -S $clipboard_bridge_socket && -S $settings_bridge_socket ]]; then
     break
   fi
   kill -0 "$qemu_pid" 2>/dev/null || fail "QEMU exited before creating its private QMP socket"
@@ -1650,7 +1904,21 @@ done
 [[ -S $audio_bridge_socket ]] || fail "QEMU did not create its private audio bridge socket"
 [[ -S $authentication_bridge_socket ]] || fail "QEMU did not create its private authentication bridge socket"
 [[ -S $camera_bridge_socket ]] || fail "QEMU did not create its private camera bridge socket"
+[[ -S $battery_bridge_socket ]] || fail "QEMU did not create its private battery bridge socket"
+[[ -S $timezone_bridge_socket ]] || fail "QEMU did not create its private time zone bridge socket"
 [[ -S $clipboard_bridge_socket ]] || fail "QEMU did not create its private clipboard bridge socket"
+[[ -S $settings_bridge_socket ]] || fail "QEMU did not create its private settings bridge socket"
+# The socket file appears before QEMU's main loop accepts connections, and the
+# helper tears the VM down if the monitor behind this line does not answer.
+# Use the bundled helper so release launches do not depend on host Python.
+# Wait on a child so Bash can service cancellation signals during slow init.
+"$native_bridge" --wait-for-qmp "$qemu_pid" "$qmp_socket" 9>&- &
+monitor_ready_pid=$!
+if ! wait "$monitor_ready_pid"; then
+  monitor_ready_pid=""
+  fail "QEMU's QMP monitor did not become ready"
+fi
+monitor_ready_pid=""
 echo "[qemu-gpu] Ready. QMP: $qmp_socket" >&2
 
 # FD 9 deliberately remains open only in QEMU. Letting sibling bridges
@@ -1693,9 +1961,42 @@ camera_bridge_restarts=0
 
 # Bash 3.2 has no `wait -n`. Input routing and native audio are required, so
 # watch both alongside QEMU and stop the session if either exits unexpectedly.
+start_battery_bridge() {
+  "$native_bridge" --bridge-native-battery \
+    "$qemu_pid" "$battery_bridge_socket" 9>&- &
+  battery_bridge_pid=$!
+}
+start_battery_bridge
+battery_bridge_restarts=0
+
+start_timezone_bridge() {
+  "$native_bridge" --bridge-native-timezone \
+    "$qemu_pid" "$timezone_bridge_socket" 9>&- &
+  timezone_bridge_pid=$!
+}
+start_timezone_bridge
+timezone_bridge_restarts=0
+
+if [[ -f $resources_dir/integrations/manifest.json ]]; then
+  integration_cache="$work_dir/integration-status.json"
+  if [[ $QEMU_SELECTED_STORAGE_MODE == persistent ]]; then
+    integration_disk_inode=$(stat -f %i "$working_disk")
+    integration_cache="${QEMU_PERSISTENT_STORAGE_DISKS_ROOT%/disks}/integration-status-$integration_disk_inode.json"
+  fi
+  "$native_bridge" --bridge-integrations "$qemu_pid" "$integration_bridge_socket" \
+    "$integration_cache" 9>&- &
+  integration_bridge_pid=$!
+fi
+
+# Bash 3.2 has no `wait -n`. The native-audio bridge is required for the guest
+# transport, so watch it alongside QEMU and fail if it exits unexpectedly.
+qemu_is_running() {
+  local state
+  state=$(ps -p "$qemu_pid" -o state= 2>/dev/null || true)
+  [[ -n $state && $state != *Z* ]]
+}
 while true; do
-  qemu_state=$(ps -p "$qemu_pid" -o state= 2>/dev/null || true)
-  [[ -n $qemu_state && $qemu_state != *Z* ]] || break
+  qemu_is_running || break
 
   if [[ $QEMU_NETWORK_MODE == bridged && -f $QEMU_NETWORK_DIRECTORY/failed ]]; then
     cat "$QEMU_NETWORK_DIRECTORY/log" >&2
@@ -1712,6 +2013,13 @@ while true; do
       command_bridge_status=$?
     fi
     command_bridge_pid=""
+    # QMP can close just before QEMU exits. Allow normal teardown to finish;
+    # an unexpected bridge exit while the VM stays up remains fatal.
+    for ((attempt = 0; attempt < 40; attempt++)); do
+      qemu_is_running || break
+      sleep 0.05
+    done
+    qemu_is_running || break
     fail "Command-key bridge exited while QEMU was running (status $command_bridge_status)"
   fi
 
@@ -1723,12 +2031,14 @@ while true; do
       audio_bridge_status=$?
     fi
     audio_bridge_pid=""
-    for ((attempt = 0; attempt < 20; attempt++)); do
-      qemu_state=$(ps -p "$qemu_pid" -o state= 2>/dev/null || true)
-      [[ -n $qemu_state && $qemu_state != *Z* ]] || break
+    # QEMU closes its channels before its process finishes exiting. Give that
+    # teardown a short grace period, then use QEMU's real exit status below.
+    # A bridge failure while QEMU stays alive must still fail the launch.
+    for ((attempt = 0; attempt < 40; attempt++)); do
+      qemu_is_running || break
       sleep 0.05
     done
-    [[ -n $qemu_state && $qemu_state != *Z* ]] || break
+    qemu_is_running || break
     fail "native audio bridge exited while QEMU was running (status $audio_bridge_status)"
   fi
 
@@ -1747,6 +2057,7 @@ while true; do
         clipboard_bridge_restarts=$((clipboard_bridge_restarts + 1))
         echo "[qemu-gpu] clipboard bridge exited (status $clipboard_bridge_status); restarting ($clipboard_bridge_restarts/5)" >&2
         sleep 1
+        qemu_is_running || break
         start_clipboard_bridge
       else
         echo "[qemu-gpu] clipboard sharing is unavailable for the rest of this session" >&2
@@ -1789,9 +2100,46 @@ while true; do
         camera_bridge_restarts=$((camera_bridge_restarts + 1))
         echo "[qemu-gpu] camera bridge exited (status $camera_bridge_status); restarting ($camera_bridge_restarts/5)" >&2
         sleep 1
+        qemu_is_running || break
         start_camera_bridge
       else
         echo "[qemu-gpu] camera sharing is unavailable for the rest of this session" >&2
+      fi
+    fi
+  fi
+  # Battery mirroring is optional. A failed IOKit backend must not stop the
+  # VM; reconnect it so a transient failure can recover in this session.
+  if [[ $battery_bridge_pid =~ ^[0-9]+$ ]]; then
+    battery_bridge_state=$(ps -p "$battery_bridge_pid" -o state= 2>/dev/null || true)
+    if [[ -z $battery_bridge_state || $battery_bridge_state == *Z* ]]; then
+      if wait "$battery_bridge_pid"; then
+        battery_bridge_status=0
+      else
+        battery_bridge_status=$?
+      fi
+      battery_bridge_pid=""
+      if (( battery_bridge_restarts < 5 )); then
+        battery_bridge_restarts=$((battery_bridge_restarts + 1))
+        echo "[qemu-gpu] battery bridge exited (status $battery_bridge_status); restarting ($battery_bridge_restarts/5)" >&2
+        sleep 1
+        start_battery_bridge
+      else
+        echo "[qemu-gpu] battery mirroring is unavailable for the rest of this session" >&2
+      fi
+    fi
+  fi
+  if [[ $timezone_bridge_pid =~ ^[0-9]+$ ]]; then
+    timezone_bridge_state=$(ps -p "$timezone_bridge_pid" -o state= 2>/dev/null || true)
+    if [[ -z $timezone_bridge_state || $timezone_bridge_state == *Z* ]]; then
+      if wait "$timezone_bridge_pid"; then timezone_bridge_status=0; else timezone_bridge_status=$?; fi
+      timezone_bridge_pid=""
+      if (( timezone_bridge_restarts < 5 )); then
+        timezone_bridge_restarts=$((timezone_bridge_restarts + 1))
+        echo "[qemu-gpu] time zone bridge exited (status $timezone_bridge_status); restarting ($timezone_bridge_restarts/5)" >&2
+        sleep 1
+        start_timezone_bridge
+      else
+        echo "[qemu-gpu] time zone synchronization is unavailable for the rest of this session" >&2
       fi
     fi
   fi
@@ -1833,4 +2181,12 @@ if [[ $camera_bridge_pid =~ ^[0-9]+$ ]]; then
   terminate_child "$camera_bridge_pid" 20
 fi
 camera_bridge_pid=""
+if [[ $battery_bridge_pid =~ ^[0-9]+$ ]]; then
+  terminate_child "$battery_bridge_pid" 20
+fi
+battery_bridge_pid=""
+if [[ $timezone_bridge_pid =~ ^[0-9]+$ ]]; then
+  terminate_child "$timezone_bridge_pid" 20
+fi
+timezone_bridge_pid=""
 exit "$qemu_status"

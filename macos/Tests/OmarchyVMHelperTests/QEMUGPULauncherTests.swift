@@ -82,6 +82,7 @@ struct QEMUGPURuntimeEnvironmentTests {
             QEMUGPURuntimeEnvironment.inspectOnlyKey: "1",
             QEMUGPURuntimeEnvironment.dryRunKey: "1",
             QEMUGPURuntimeEnvironment.bootRecoveryConsentKey: "1",
+            QEMUGPURuntimeEnvironment.guestFixesConsentKey: "inherited consent",
         ])
 
         #expect(environment == ["KEEP_ME": "yes"])
@@ -110,9 +111,11 @@ struct QEMUGPURuntimeEnvironmentTests {
             PortForwardPolicy.environmentKey,
             VMResourceLaunchConfiguration.cpuEnvironmentKey,
             VMResourceLaunchConfiguration.memoryEnvironmentKey,
+            VMResourceLaunchConfiguration.diskEnvironmentKey,
             QEMUGPURuntimeEnvironment.inspectOnlyKey,
             QEMUGPURuntimeEnvironment.dryRunKey,
             QEMUGPURuntimeEnvironment.bootRecoveryConsentKey,
+            QEMUGPURuntimeEnvironment.guestFixesConsentKey,
         ]
         var inherited = ["KEEP_ME": "yes"]
         for key in controlledKeys {

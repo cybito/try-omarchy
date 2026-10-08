@@ -6,7 +6,7 @@
     "filesystemLabel": "omarchy-factory",
     "filesystemUuid": "89054943-1f4e-4f14-b934-d6db3fba4254",
     "sizeMiB": 6144,
-    "sourceDateEpoch": 1788886195
+    "sourceDateEpoch": 1789450452
   },
   "guest": {
     "profile": "factory",
@@ -23,10 +23,10 @@
   },
   "upstream": {
     "repository": "https://github.com/basecamp/omarchy",
-    "commit": "0534987009061cbe2dacdde4ad564092ab698d12",
-    "tree": "139193701d7ddc948c12dfa2d15de070546ee520",
-    "treeSha256": "21d4d4edec113126aaa65d04adb7d5a422f4b18d685c1e2e08fa5c51b621fa60",
-    "release": "4.0.3",
+    "commit": "c668141e9c42b13c80c9ca4ea108e11708c5e8a5",
+    "tree": "1d48adc1ba8636fd9362f7b9bf8819f3ac3258a4",
+    "treeSha256": "c7ae35645b64a205a3ac7af094b17ea0f406a710eb00185470a76f3ae8367952",
+    "release": "4.0.4",
     "version": "4.0.0.alpha",
     "channel": "quattro",
     "license": "MIT"
@@ -37,14 +37,14 @@
     "archLinuxArmPackagesRepository": "https://github.com/archlinuxarm/PKGBUILDs",
     "archLinuxArmPackagesCommit": "0b5418fc3f62860b191cd872cb2f933f9fc77841",
     "hyprland": {
-      "version": "0.56.1",
+      "version": "0.56.2",
       "pkgrel": "3.2",
-      "upstreamPackageVersion": "0.56.1-3",
+      "upstreamPackageVersion": "0.56.2-3",
       "repository": "https://github.com/hyprwm/Hyprland",
-      "commit": "5c9377c15f85c50648f35ca5a213754f95b93ca0",
-      "url": "https://github.com/hyprwm/Hyprland/releases/download/v0.56.1/source-v0.56.1.tar.gz",
-      "sha256": "c5b26eb377360358d01839a1de43fdc004a33e56d6a5d442fdad69b9f3a10549",
-      "upstreamPackageSha256": "4fcb1b5efe019e184a85b234f75151e68fd8f60ace9b06ff59e7ffbd8a280f7a",
+      "commit": "efb50993780079460b0cbed1363e2166a2de1d9f",
+      "url": "https://github.com/hyprwm/Hyprland/releases/download/v0.56.2/source-v0.56.2.tar.gz",
+      "sha256": "03ad3f5ef152ff44116ffd56fcf808486211ecabf4f0ba567108ee746ba5cd2e",
+      "upstreamPackageSha256": "dba57b0cba04557b7fa3478253c93fe4c8e88737f8dd570c0820177f567e5a95",
       "patch": "patches/hyprland/rounded-border-coverage.patch",
       "patchSha256": "5da431cbca37bdd9a66edeb77c3d677b7033d5f91449158e3ffa58a4eb515828",
       "glazeVersion": "7.2.0",
@@ -52,7 +52,7 @@
       "glazeUrl": "https://github.com/stephenberry/glaze/archive/refs/tags/v7.2.0.tar.gz",
       "glazeSha256": "17dba19ae63ae48f94994f00d49d5cb3c8f1306db1046c534c4828662490b7d4",
       "glazeLicenseSha256": "5d49e66411a0807a7c8d6b911b9a26b59e940c71aebe561a3ad8b0b80ac4b7b6",
-      "binarySha256": "b0c96f3057f9f4000c5e50adba0f6020dd7f63747e64371adcd4b30b97eabdb9",
+      "binarySha256": "32bd58fd20883240eb7f1d85da0e7f64b1582c8ea3c18c947d98bc219964019d",
       "license": "BSD-3-Clause",
       "issue": "https://github.com/omacom/try-omarchy/issues/5",
       "buildPackages": {
@@ -62,27 +62,15 @@
         "gcc": "16.1.1+r12+g301eb08fa2c5-1",
         "gcc-libs": "16.1.1+r12+g301eb08fa2c5-1",
         "glibc": "2.43+r22+g8362e8ce10b2-2",
-        "hyprland": "0.56.1-3",
-        "hyprland-protocols": "0.7.0-1",
+        "hyprland": "0.56.2-3",
+        "hyprland-protocols": "0.7.1-1",
+        "hyprwayland-scanner": "0.4.6-1",
         "make": "4.4.1-3",
-        "meson": "1.12.0-1",
+        "meson": "1.12.1-1",
         "ninja": "1.13.2-3",
         "pkgconf": "3.0.7-1",
         "xorgproto": "2025.1-1"
       }
-    },
-    "aquamarine": {
-      "version": "0.14.0",
-      "pkgrel": "2",
-      "repository": "https://github.com/hyprwm/aquamarine",
-      "url": "https://github.com/hyprwm/aquamarine/archive/v0.14.0/aquamarine-0.14.0.tar.gz",
-      "sha256": "5dcf0b17f7dd51539fd7e79d68484f04240b3b63cf9f5f21d5b6dea0088168f9",
-      "pkgbuild": "pinned-packages/aquamarine/PKGBUILD",
-      "pkgbuildSha256": "1bd4197238a4f0092216ab2dfd723126d618cceb977d45865e140a488a8f56ff",
-      "packagingRepository": "https://gitlab.archlinux.org/archlinux/packaging/packages/aquamarine.git",
-      "packagingCommit": "8489a8358817a964a923f05ba324996378d81a5d",
-      "license": "BSD-3-Clause",
-      "binarySha256": "7da003aa60e008e9f514c312f01c1e967983e2c46732d58953735bfaee3fd8aa"
     },
     "mise": {
       "version": "2026.8.11",
@@ -91,6 +79,11 @@
       "binarySha256": "6b7471271a990cbd6a795b24f9df83338aa220c227bf75fd083442e5a728f5f7",
       "reportedVersion": "2026.8.11 linux-arm64 (2026-08-23)",
       "license": "MIT"
+    },
+    "tryOmarchyBattery": {
+      "version": "1.3.0",
+      "pkgrel": "1",
+      "license": "GPL-2.0-only"
     },
     "ttfx": {
       "version": "0.3.2",
@@ -187,18 +180,20 @@
         }
       }
     },
-    "hyprtoolkit": {
-      "version": "0.5.4",
-      "pkgrel": "6.1",
-      "repository": "https://github.com/hyprwm/hyprtoolkit",
-      "url": "https://github.com/hyprwm/hyprtoolkit/archive/v0.5.4/hyprtoolkit-0.5.4.tar.gz",
-      "sha256": "2fb59789f231c1c4e9154ceffc1e7524c0cae154807c0d57e6166806255b570f",
-      "pkgbuild": "pinned-packages/hyprtoolkit/PKGBUILD",
-      "pkgbuildSha256": "803f1db19ad1d42e48b638e35256d3dabbe19d1d0b4b3fd584eedf20121256ce",
-      "packagingRepository": "https://gitlab.archlinux.org/archlinux/packaging/packages/hyprtoolkit.git",
-      "packagingCommit": "1ed230388a2ccb2c857af980235cf25a4f86e39e",
-      "license": "BSD-3-Clause",
-      "binarySha256": "dc814fad9723bfcf66dbd29b7f8c5cc96fd63a1ff623909e466dd9d011c0cba8"
+    "ghostty": {
+      "version": "1.3.1",
+      "pkgrel": "2",
+      "sourceUrl": "https://release.files.ghostty.org/1.3.1/ghostty-1.3.1.tar.gz",
+      "sourceSha256": "3349d25600ffbda281197a18314f7d18791969cffe9474f0ff16a45a9ebfccdb",
+      "signingKey": "RWQlAjJC23149WL2sEpT/l0QKy7hMIFhYdQOFy0Z7z7PbneUgvlsnYcV",
+      "zigVersion": "0.15.2",
+      "zigUrl": "https://ziglang.org/download/0.15.2/zig-aarch64-linux-0.15.2.tar.xz",
+      "zigSha256": "958ed7d1e00d0ea76590d27666efbf7a932281b3d7ba0c6b01b0ff26498f667f",
+      "recipe": "native-overlay/usr/local/share/try-omarchy/ghostty/PKGBUILD",
+      "recipeSha256": "039101852ca314042c7a28892554418ca7f067a174c4dea3bdc453182bbde28c",
+      "wrapperSha256": "c41b20e46f257da7a06ee8c67b1056d099f61d7935ac2014525b1b2b1f74f827",
+      "license": "MIT",
+      "signatureSha256": "5591816f6a52f03d1ea5be0129fcc396aeece7238419cdd36e511546ee242798"
     }
   },
   "themes": [
@@ -213,15 +208,9 @@
     "packages": "packages.txt",
     "packageLock": "packages.lock.json",
     "pacmanConfig": "pacman.aarch64.conf",
-    "abiPackagePins": [
-      {
-        "name": "aquamarine",
-        "version": "0.14.0-2"
-      },
-      {
-        "name": "hyprtoolkit",
-        "version": "0.5.4-6.1"
-      }
+    "packageRepositoryMirrors": [
+      "https://ca.us.mirror.archlinuxarm.org/aarch64",
+      "https://de3.mirror.archlinuxarm.org/aarch64"
     ]
   },
   "authenticity": {
@@ -256,12 +245,12 @@
         "description": "Install 1Password from its signed ARM64 release with VM-compatible launchers and Quick Access.",
         "reference": "https://github.com/basecamp/omarchy/issues/87",
         "patch": "patches/omarchy/1password-arm64-installer.patch",
-        "patchSha256": "8696ada095cd8c4a5b42ed0466417e423cb4cbce122ddb52870c565d2bf40bca",
+        "patchSha256": "8bdf7242d7ec4ffa6e6dd114b0944962a905a2dcb83d47ef804d0f4f418de739",
         "targets": [
           {
             "path": "bin/omarchy-install-service-1password",
             "beforeSha256": "5d5a5a9b3cf87579b4232067c9f7c78091cecf250111b802ffffa49c607f52d7",
-            "afterSha256": "ce404a13daf7cb08fab413ae0100786fc64abe6aefc403147114e6208c58b5c4"
+            "afterSha256": "336be4cca1c085ea9d5344920bcb19220fc5f297629c79ffde4b77b1d66e3c4a"
           },
           {
             "path": "default/hypr/bindings/applications.lua",
@@ -381,6 +370,34 @@
         ]
       },
       {
+        "id": "update-restart-arm-kernel",
+        "description": "Recognize package-owned ARM kernel module metadata and explicitly distinguish matching, changed, and unknown kernel reboot states.",
+        "reference": "https://github.com/basecamp/omarchy/blob/346e69e1cec6c4e8924531874af6ba010a1bc99e/bin/omarchy-update-restart",
+        "patch": "patches/omarchy/update-restart-arm-kernel.patch",
+        "patchSha256": "307efd205ff1e7ab83c10043be81ee2024ae30df006ed93c4fd33d3ac8660a20",
+        "targets": [
+          {
+            "path": "bin/omarchy-update-restart",
+            "beforeSha256": "7bc95f8a0a3ae35cfd81453e08194f5660c27cf59528c7d95b4345f362030b60",
+            "afterSha256": "c791af27312db4cf4f11ec4d112a3e4f50654d82143368166bf385c25f92f5d9"
+          }
+        ]
+      },
+      {
+        "id": "first-run-update-notification",
+        "description": "Clarify the first-login invitation for supported package updates and optional setup in the pinned Try Omarchy guest.",
+        "reference": "https://github.com/basecamp/omarchy/blob/c668141e9c42b13c80c9ca4ea108e11708c5e8a5/install/user/first-run/wifi.sh",
+        "patch": "patches/omarchy/first-run-update-notification.patch",
+        "patchSha256": "05d95049f1a6dd3efaa59c429d6922835e1c54b1d3b0286db30378f60eb7847f",
+        "targets": [
+          {
+            "path": "install/user/first-run/wifi.sh",
+            "beforeSha256": "4cc2621157be1efe6d449d1daa7b28d588e4a8e46127de493da03749af1ae5a7",
+            "afterSha256": "cbbffcfd2685c0b9853ee144a7acba64dfa9340cc65a3d144a925055810f0f66"
+          }
+        ]
+      },
+      {
         "id": "pkg-add-aarch64-unavailable",
         "description": "Refuse known aarch64-unavailable packages from omarchy-pkg-add with the shared message.",
         "reference": "https://github.com/basecamp/omarchy/blob/346e69e1cec6c4e8924531874af6ba010a1bc99e/bin/omarchy-pkg-add",
@@ -463,6 +480,87 @@
             "afterSha256": "22062e6fc14f8405d3da23f2edc892fc22dcaf51ed4c944ee5d7c0fc3b0992bd"
           }
         ]
+      },
+      {
+        "id": "keyboard-us-acentos",
+        "description": "Add US International with dead keys and distinguish the Brazilian ABNT2 keyboard option.",
+        "reference": "https://github.com/omacom/try-omarchy/issues/194",
+        "patch": "patches/omarchy/keyboard-us-acentos.patch",
+        "patchSha256": "e81e1bd6b23816ecc2d2360b446e29c27947314d3cc5b3181d38982b8c16ec0d",
+        "targets": [
+          {
+            "path": "install/provisioning/setup-form.sh",
+            "beforeSha256": "0fbb8c3c8b151e5ff884c16d381e12fda53cc16adfd08a684d41e7327250665d",
+            "afterSha256": "5e2288809a3d9cc2cf91ca955be97b5fdcf6e786b7e8e3be6ea1a1b19abda15c"
+          }
+        ]
+      },
+      {
+        "id": "ghostty-arm64-terminal",
+        "description": "Build and install a verified ARM64 Ghostty package through the terminal menu.",
+        "reference": "https://github.com/omacom/try-omarchy/issues/137",
+        "patch": "patches/omarchy/ghostty-arm64-terminal.patch",
+        "patchSha256": "f5802f10eb2a5d6f52d74b0241bcbbd7f06a433f3bfce616907da553b3ee3e57",
+        "targets": [
+          {
+            "path": "bin/omarchy-install-terminal",
+            "beforeSha256": "41d1f9bb3d503e895795115236c2fe7146b5fe9184aec06de349137ad4f4069b",
+            "afterSha256": "b65dd81b1bd9820445d1e7ca60c0a978c684c96e3e0280522c60944d1f676be4"
+          }
+        ]
+      },
+      {
+        "id": "mirror-macos-timezone",
+        "description": "Offer explicit live macOS time zone mirroring in owner setup and the timezone menu.",
+        "reference": "https://github.com/themartiano/try-omarchy/pull/290",
+        "patch": "patches/omarchy/mirror-macos-timezone.patch",
+        "patchSha256": "e7bd2f1c3735f1e3de202a9d5b655ff71d8a17019fea011b7fed6951823daa37",
+        "targets": [
+          {
+            "path": "bin/omarchy-provision-owner",
+            "beforeSha256": "5c71fd5730473850a598628e1d82dda3b5517a31b8a8b1e64e24e08ee73b7dea",
+            "afterSha256": "be9b355f15a987d4402578682c870736519f3b1982da93e1473c1165ee27be5c"
+          },
+          {
+            "path": "bin/omarchy-menu-timezone",
+            "beforeSha256": "3b36b51935d43e5ab31ea7c12a8adcec310165ccceabe16b6ddf060bbb2ccbe0",
+            "afterSha256": "134c9cc00a0c638a3f0259e5674b99771f7d6bba957226176b0cd5e1646e40ca"
+          }
+        ]
+      },
+      {
+        "id": "macos-power-profile",
+        "description": "Show the read-only macOS power profile and preserve the Mac battery charge state while power estimates settle.",
+        "reference": "https://github.com/basecamp/omarchy/blob/c668141e9c42b13c80c9ca4ea108e11708c5e8a5/bin/omarchy-powerprofiles-set",
+        "patch": "patches/omarchy/macos-power-profile.patch",
+        "patchSha256": "2a9705076837550226d64b337fdd554a08d6e90efbba4ed1cff7f11e516b6fe4",
+        "targets": [
+          {
+            "path": "bin/omarchy-powerprofiles-list",
+            "beforeSha256": "3d2e4b3d5ad974aa78c97a653d3fe937bd263063369a57f14918748502d1f609",
+            "afterSha256": "7d400e3f4c3dc74809a006b14e712ebdf3dfe45765a24d1db4f85a602bb1b9cc"
+          },
+          {
+            "path": "bin/omarchy-powerprofiles-set",
+            "beforeSha256": "4595bb75e4000e2fc01bd3c7f1e578d07aecfa54e9dcd4e2d32d653c35bc66a9",
+            "afterSha256": "85c47a6ae1d45add248f85fa27dad359c06bc16fc9e3900631603a790f6c53d7"
+          },
+          {
+            "path": "shell/plugins/panels/power/Panel.qml",
+            "beforeSha256": "560e17a5144d3e2ea1e0ad36c2aec563909b535551e1e66e061f5fb25f1d4ec0",
+            "afterSha256": "6efe9c44dc5ea763f6d2246319ea94cf8e5944c0722421eac06da448c5744566"
+          },
+          {
+            "path": "shell/plugins/menu/Menu.qml",
+            "beforeSha256": "0154d0ec3855fbb48aa06eaa724a19f3c07c377494d4a3de65daed2d7d9100e3",
+            "afterSha256": "bcbeefec65fddec4747c8bd715bf419c49a1b646b99d52aa882b85825f130b89"
+          },
+          {
+            "path": "shell/plugins/panels/power/Model.js",
+            "beforeSha256": "5ed21781bcd315742b8eda1aa72f415f72217a38e03c659fe40095ed939f7ed2",
+            "afterSha256": "bcbd73585f586159fc3b3cbcc4fecf8dd9eafdde5af87430c90db283ffc0b8a0"
+          }
+        ]
       }
     ],
     "postBuildUserInstallers": [
@@ -491,6 +589,14 @@
           "which"
         ],
         "factoryProvenance": "excluded"
+      },
+      {
+        "id": "ghostty-arm64",
+        "userInitiated": true,
+        "delivery": "pinned-signed-source-build",
+        "applicationUrl": "https://release.files.ghostty.org/1.3.1/ghostty-1.3.1.tar.gz",
+        "applicationSha256": "3349d25600ffbda281197a18314f7d18791969cffe9474f0ff16a45a9ebfccdb",
+        "factoryProvenance": "installer-only"
       }
     ],
     "requiredPaths": [
@@ -503,6 +609,7 @@
       "bin/omarchy-provision-user",
       "bin/omarchy-screensaver",
       "bin/omarchy-theme-set",
+      "config/chromium-flags.conf",
       "config/foot/foot.ini",
       "config/hypr/hyprland.lua",
       "config/hypr/monitors.lua",
@@ -532,7 +639,7 @@
     "initramfsSource": "/boot/initramfs-linux.img",
     "disk": "rootfs.ext4",
     "compressedDisk": "rootfs.ext4.zst",
-    "kernelCommandLine": "root=/dev/vda rw rootwait console=tty0 console=hvc0 loglevel=4 systemd.show_status=false rd.systemd.show_status=false mitigations=off nowatchdog",
+    "kernelCommandLine": "root=/dev/vda rw rootwait console=tty0 console=hvc0 loglevel=4 systemd.show_status=false rd.systemd.show_status=false mitigations=off nowatchdog tryomarchy.locale_support=2",
     "minimumMemoryMiB": 2048,
     "recommendedMemoryMiB": 4096,
     "minimumCpuCount": 4,
@@ -542,7 +649,7 @@
       "device": "virtio-gpu-gl-pci",
       "display": "cocoa",
       "guestRenderer": "virgl",
-      "hostRenderer": "angle-metal"
+      "hostRenderer": "macos-opengl"
     },
     "network": {
       "device": "virtio-net-pci",
@@ -580,6 +687,14 @@
       "port": "dev.tryomarchy.camera",
       "protocolVersion": 1,
       "width": 1280
+    },
+    "battery": {
+      "activation": "always-on",
+      "device": "virtserialport",
+      "direction": "host-to-guest",
+      "guestSupplies": ["ADP0", "BAT0"],
+      "port": "dev.tryomarchy.battery",
+      "protocolVersion": 1
     },
     "storage": {
       "device": "virtio-blk-pci",

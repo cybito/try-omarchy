@@ -5,11 +5,13 @@ set -euo pipefail
 usage() {
   cat >&2 <<'EOF'
 Usage: macos/build-app.sh [--open] [--dmg] [--guest-dir DIR]
+                                  [--configuration development|production]
                                   [--sign-identity IDENTITY]
                                   [--notarize-profile PROFILE]
 
-Build a self-contained Apple Silicon app. Developer ID signing is used when
---sign-identity is supplied; otherwise the local build is ad-hoc signed.
+Build a self-contained Apple Silicon app. Development builds select a stable
+local signing certificate automatically. Production builds require an explicit
+signing identity. --dmg requires --configuration production.
 --notarize-profile implies --dmg and names a notarytool keychain profile.
 EOF
   exit 64
@@ -18,12 +20,18 @@ EOF
 open_app=0
 build_dmg=0
 guest_dir=
-sign_identity=${OMARCHY_CODESIGN_IDENTITY:--}
+configuration=development
+sign_identity=${OMARCHY_CODESIGN_IDENTITY:-auto}
 notarize_profile=
 while (($#)); do
   case "$1" in
     --open) open_app=1; shift ;;
     --dmg) build_dmg=1; shift ;;
+    --configuration)
+      (($# >= 2)) || usage
+      configuration=$2
+      shift 2
+      ;;
     --guest-dir)
       (($# >= 2)) || usage
       guest_dir=$2
@@ -44,11 +52,40 @@ while (($#)); do
   esac
 done
 
+macos_major=$(sw_vers -productVersion | cut -d. -f1)
+[[ $macos_major =~ ^[0-9]+$ ]] && (( macos_major >= 15 )) || {
+  echo "build-app: macOS 15 or newer is required" >&2
+  exit 1
+}
+
 macos_dir=$(cd "$(dirname "$0")" && pwd)
 repo_dir=$(cd "$macos_dir/.." && pwd -P)
+case "$configuration" in
+  development)
+    bundle_identifier=dev.tryomarchy.native.development
+    app_display_name='Try Omarchy Dev'
+    (( build_dmg == 0 )) || {
+      echo 'build-app: --dmg requires --configuration production' >&2
+      exit 1
+    }
+    sign_identity=$(python3 "$macos_dir/development-sign-identity.py" "$sign_identity")
+    ;;
+  production)
+    bundle_identifier=dev.tryomarchy.native
+    app_display_name='Try Omarchy'
+    [[ $sign_identity != auto ]] || {
+      echo 'build-app: production requires --sign-identity (use - for an explicit ad-hoc test build)' >&2
+      exit 1
+    }
+    ;;
+  *) usage ;;
+esac
 helper="$macos_dir/.build/release/omarchy-vm-helper"
 legacy_app="$repo_dir/dist/Try Omarchy.app"
 app="$repo_dir/dist/app.noindex/Try Omarchy.app"
+if [[ $configuration == production ]]; then
+  app="$repo_dir/dist/release.noindex/Try Omarchy.app"
+fi
 contents="$app/Contents"
 bundled_qemu="$contents/Resources/runtime/bin/Try Omarchy"
 module_cache="$macos_dir/.build/module-cache"
@@ -115,7 +152,7 @@ if [[ -e $legacy_app || -L $legacy_app ]]; then
   fi
   rm -rf -- "$legacy_app"
 fi
-mkdir -p "$repo_dir/dist/app.noindex"
+mkdir -p "$(dirname "$app")"
 # A .noindex container is the supported per-directory Spotlight exclusion.
 # Removing and unregistering the legacy bundle above also prevents a previously
 # indexed build at the old path from surviving this migration.
@@ -179,16 +216,62 @@ PYTHON
 install -m 0644 "$macos_dir/network-helper/vendor/LICENSE" "$contents/Resources/network/LICENSE.socket_vmnet"
 install -m 0755 "$helper" "$contents/MacOS/omarchy-vm-helper"
 install -m 0644 "$macos_dir/Info.plist" "$contents/Info.plist"
+python3 - "$contents/Info.plist" "$bundle_identifier" "$app_display_name" <<'PYTHON'
+import plistlib, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+value = plistlib.loads(path.read_bytes())
+value["CFBundleIdentifier"] = sys.argv[2]
+value["CFBundleName"] = value["CFBundleDisplayName"] = sys.argv[3]
+path.write_bytes(plistlib.dumps(value))
+PYTHON
+python3 "$repo_dir/scripts/app_version.py" \
+  --root "$repo_dir" --plist "$contents/Info.plist"
 install -m 0644 "$macos_dir/Credits.rtf" "$contents/Resources/Credits.rtf"
 install -m 0644 "$repo_dir/LICENSE" "$contents/Resources/LICENSE"
 install -m 0644 "$generated_icon" "$contents/Resources/TryOmarchy.icns"
 ditto "$runtime_source" "$contents/Resources/runtime"
 install -m 0755 "$macos_dir/run-qemu-gpu.sh" "$contents/Resources/scripts/run-qemu-gpu.sh"
+install -m 0755 "$repo_dir/guest/native-overlay/usr/local/sbin/try-omarchy-migrate-alacritty" \
+  "$contents/Resources/scripts/try-omarchy-migrate-alacritty"
 install -m 0644 "$macos_dir/qemu-persistent-storage.sh" \
   "$contents/Resources/scripts/qemu-persistent-storage.sh"
 install -m 0644 "$macos_dir/qemu-port-forwarding.sh" \
   "$contents/Resources/scripts/qemu-port-forwarding.sh"
 install -m 0644 "$macos_dir/qemu-networking.sh" "$contents/Resources/scripts/qemu-networking.sh"
+# Ship settings and the shared-folder safety helper to existing VMs at boot.
+settings_payload="$contents/Resources/guest-settings"
+mkdir -p "$settings_payload"
+install -m 0644 "$macos_dir/guest-settings.service" "$settings_payload/guest-settings.service"
+install -m 0644 "$repo_dir/guest/scripts/install-settings-integration.py" "$settings_payload/install.py"
+install -m 0644 "$repo_dir/guest/scripts/migrate-boot-fixes.py" "$settings_payload/migrate.py"
+install -m 0644 "$repo_dir/guest/native-overlay/usr/local/sbin/try-omarchy-migrate-alacritty" "$settings_payload/try-omarchy-migrate-alacritty"
+for relative in \
+  usr/local/share/try-omarchy/power-profile-hooks.json \
+  usr/local/lib/try-omarchy/install-power-profile.py \
+  usr/local/bin/omarchy-native-mac-share \
+  usr/local/bin/omarchy-native-settings \
+  usr/local/bin/omarchy-native-clipboard-bridge \
+  usr/bin/omarchy-screensaver \
+  usr/local/bin/omarchy-native-screensaver-text \
+  usr/local/bin/omarchy-native-cursor-restore \
+  usr/local/bin/try-omarchy-timezone \
+  usr/local/share/try-omarchy/timezone-setup.sh \
+  usr/local/share/try-omarchy/timezone-menu-hooks.json \
+  usr/local/lib/try-omarchy/install-timezone-menus.py \
+  usr/local/bin/tzupdate \
+  usr/lib/systemd/system/try-omarchy-timezone.service \
+  etc/udev/rules.d/96-try-omarchy-timezone.rules \
+  etc/udev/rules.d/92-omarchy-native-settings.rules \
+  usr/share/applications/try-omarchy-settings.desktop \
+  usr/share/applications/try-omarchy-follow-timezone.desktop \
+  etc/skel/.config/omarchy/extensions/omarchy-menu.jsonc; do
+  install -m 0644 "$repo_dir/guest/native-overlay/$relative" "$settings_payload/${relative##*/}"
+done
+python3 "$repo_dir/guest/scripts/boot-fix-components.py" --payload "$repo_dir/guest" "$settings_payload"
+python3 "$repo_dir/guest/scripts/migrate-boot-fixes.py" --manifest "$settings_payload"
+install -m 0644 "$macos_dir/network-identity.py" "$contents/Resources/scripts/network-identity.py"
+python3 "$repo_dir/integrations/build-bundle.py" "$contents/Resources/integrations"
 for guest_resource in \
   LICENSE.omarchy \
   SHA256SUMS \
@@ -216,10 +299,18 @@ mv "$contents/Resources/runtime/bin/qemu-system-aarch64" "$bundled_qemu"
 
 sign_options=(--force --sign "$sign_identity")
 if [[ $sign_identity != - ]]; then
-  sign_options+=(--options runtime --timestamp)
+  sign_options+=(--options runtime)
+  if [[ $configuration == production ]]; then
+    sign_options+=(--timestamp)
+  else
+    # Local rebuilds need a stable identity, not a distribution timestamp.
+    # Explicitly disable it: Developer ID identities otherwise request one
+    # by default, including when selected as a development fallback.
+    sign_options+=(--timestamp=none)
+  fi
 fi
-app_sign_options=("${sign_options[@]}" --identifier dev.tryomarchy.native)
-qemu_sign_options=("${sign_options[@]}" --identifier dev.tryomarchy.native)
+app_sign_options=("${sign_options[@]}" --identifier "$bundle_identifier")
+qemu_sign_options=("${sign_options[@]}" --identifier "$bundle_identifier")
 for library in "$contents/Resources/runtime/lib"/*.dylib; do
   codesign "${sign_options[@]}" "$library"
 done

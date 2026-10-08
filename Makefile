@@ -4,18 +4,26 @@ override ROOT := $(realpath $(dir $(lastword $(MAKEFILE_LIST))))
 override DIST := $(ROOT)/dist
 override GUEST_DIST := $(DIST)/guest
 override APP := $(DIST)/app.noindex/Try Omarchy.app
-override DMG := $(DIST)/TryOmarchy.dmg
 override BUILD_CACHE := $(ROOT)/scripts/build-cache.py
 override BUILD_STATE := $(ROOT)/.build/state
 RELEASE_SIGN_IDENTITY ?= Developer ID Application: Eduardo Martinez (RZC79MPD34)
 RELEASE_NOTARY_PROFILE ?= try-omarchy
-DEVELOPMENT_SIGN_IDENTITY ?= -
+VERSION ?=
+export VERSION RELEASE_SIGN_IDENTITY RELEASE_NOTARY_PROFILE
+DEVELOPMENT_SIGN_IDENTITY ?= auto
 PACKAGE_SIGN_IDENTITY ?= $(RELEASE_SIGN_IDENTITY)
 PACKAGE_NOTARY_PROFILE ?= $(RELEASE_NOTARY_PROFILE)
 FORCE ?= 0
+TEST_JOBS ?= 4
+
+SHELL_TESTS := network-helper qemu-networking qemu-port-forwarding \
+  run-qemu-ssh-contract qemu-memory-contract qemu-power-actions \
+  qemu-usb-passthrough qemu-monitor-ready qemu-persistent-storage
+SHELL_TEST_TARGETS := $(addprefix test-shell-,$(SHELL_TESTS))
 
 .DEFAULT_GOAL := help
-.PHONY: help doctor test guest runtime app build run run-ephemeral reset update-omarchy package package-preflight release release-preflight clean clean-all clean-guest
+.PHONY: help doctor test guest runtime app build run run-ephemeral reset update-omarchy version-preflight package package-preflight release release-preflight clean clean-all clean-guest
+.PHONY: test-all test-contracts test-guest test-swift test-shell test-resize $(SHELL_TEST_TARGETS)
 
 help:
 	@printf '%s\n' \
@@ -23,15 +31,18 @@ help:
 	  '' \
 	  '  make doctor         Check the local toolchain' \
 	  '  make test           Run native and guest contract tests' \
+	  '  make test TEST_JOBS=1  Run test suites serially for debugging' \
 	  '  make build          Build only changed guest, runtime, and app inputs' \
 	  '  make build FORCE=1  Rebuild every component' \
 	  '  make run            Build the app from existing artifacts and open it' \
+	  '                      Automatically select a stable development certificate' \
 	  '  make run DEVELOPMENT_SIGN_IDENTITY="Apple Development: ..."' \
-	  '                      Keep macOS privacy grants across local rebuilds' \
+	  '                      Choose a certificate when several are available' \
 	  '  make update-omarchy OMARCHY_RELEASE=x.y.z' \
 	  '                      Pin an upstream release and refresh the ARM64 lock' \
 	  '  make package        Create a signed and notarized distribution DMG' \
-	  '  make release        Create a signed and notarized distribution DMG' \
+	  '  make release        Choose a version, tag, and build a notarized DMG' \
+	  '  make release VERSION=vX.Y.Z  Choose the version without prompting' \
 	  '' \
 	  'Component builds:' \
 	  '  make guest          Ensure dist/guest is current (Docker)' \
@@ -53,23 +64,47 @@ doctor:
 	@printf 'Toolchain ready: %s (%s)\n' "$$(sw_vers -productVersion)" "$$(uname -m)"
 
 test:
+	@[[ "$(TEST_JOBS)" =~ ^[1-9][0-9]*$$ ]] || { echo 'error: TEST_JOBS must be a positive integer' >&2; exit 1; }
+	@$(MAKE) --no-print-directory -j$(TEST_JOBS) test-all
+
+# Start Swift early; shell integration suites consume its helper binary. Each
+# suite owns its temporary state, but SwiftPM has a single build directory.
+test-all: test-swift test-contracts test-guest test-shell test-resize
+
+test-contracts:
+	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/macos/Tests/test-hda-recovery.py"
+	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/macos/Tests/test-network-identity.py"
 	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/macos/Tests/test-libslirp-icmp.py"
 	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/macos/Tests/test-cocoa-pinch.py"
+	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/macos/Tests/test-cocoa-scroll.py"
+	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/macos/Tests/test-cocoa-iso-keyboard.py"
+	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/macos/Tests/test-cocoa-injected-text.py"
+	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/macos/Tests/test-hvf-memory-reclaim.py"
+	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/macos/Tests/test-hvf-mapped-sections.py"
 	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/macos/Tests/test-virtio-pinch.py"
 	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/tests/test-build-cache.py"
+	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/tests/test-profile-process.py"
+	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/tests/test-development-sign-identity.py"
+	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/tests/test-app-version.py"
+	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/tests/test-release.py"
+	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/tests/test-package-dmg.py"
 	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/tests/test-pack-app-icon.py"
-	@$(ROOT)/guest/test
 	@$(ROOT)/macos/Tests/macos-compatibility.test.sh
 	@$(ROOT)/macos/Tests/runtime-relocation.test.sh
+
+test-guest:
+	@$(ROOT)/guest/test
+
+test-swift:
 	@mkdir -p $(ROOT)/macos/.build/module-cache/swift $(ROOT)/macos/.build/module-cache/clang
 	@cd $(ROOT)/macos && SWIFT_MODULECACHE_PATH=$(ROOT)/macos/.build/module-cache/swift CLANG_MODULE_CACHE_PATH=$(ROOT)/macos/.build/module-cache/clang swift test --disable-sandbox
-	@bash $(ROOT)/macos/Tests/network-helper.test.sh
-	@bash $(ROOT)/macos/Tests/qemu-networking.test.sh
-	@$(ROOT)/macos/Tests/qemu-port-forwarding.test.sh
-	@$(ROOT)/macos/Tests/run-qemu-ssh-contract.test.sh
-	@$(ROOT)/macos/Tests/qemu-memory-contract.test.sh
-	@$(ROOT)/macos/Tests/qemu-power-actions.test.sh
-	@$(ROOT)/macos/Tests/qemu-persistent-storage.test.sh
+
+test-shell: $(SHELL_TEST_TARGETS)
+
+$(SHELL_TEST_TARGETS): test-shell-%: test-swift
+	@bash "$(ROOT)/macos/Tests/$*.test.sh"
+
+test-resize: test-swift
 	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/macos/Tests/resize-vm-disk.test.py"
 
 guest:
@@ -83,8 +118,9 @@ runtime:
 	  "$(ROOT)/macos/build-qemu-gpu-runtime.sh"
 
 app: guest runtime
-	@OMARCHY_FORCE_BUILD="$(FORCE)" \
-	  OMARCHY_CODESIGN_IDENTITY="$(DEVELOPMENT_SIGN_IDENTITY)" \
+	@identity=$$(python3 "$(ROOT)/macos/development-sign-identity.py" "$(DEVELOPMENT_SIGN_IDENTITY)") || exit 1; \
+	  OMARCHY_FORCE_BUILD="$(FORCE)" \
+	  OMARCHY_CODESIGN_IDENTITY="$$identity" \
 	  "$(BUILD_CACHE)" \
 	  --root "$(ROOT)" --state-dir "$(BUILD_STATE)" app -- \
 	  "$(ROOT)/macos/build-app.sh" --guest-dir "$(GUEST_DIST)"
@@ -111,13 +147,17 @@ update-omarchy:
 	  --refresh-package-lock "$(ROOT)/guest/packages.lock.json"
 	@$(ROOT)/guest/test --source "$(ROOT)/.build/upstream/omarchy-v$(OMARCHY_RELEASE)"
 
-package-preflight:
+version-preflight:
+	@python3 "$(ROOT)/scripts/app_version.py" --root "$(ROOT)" --require-release
+
+package-preflight: version-preflight
 	@[[ "$(PACKAGE_SIGN_IDENTITY)" == "Developer ID Application:"* ]] || { echo 'error: PACKAGE_SIGN_IDENTITY must be a Developer ID Application identity' >&2; exit 1; }
 	@[[ -n "$(strip $(PACKAGE_NOTARY_PROFILE))" ]] || { echo 'error: PACKAGE_NOTARY_PROFILE must name a notarytool keychain profile' >&2; exit 1; }
 
 package: package-preflight
 	@$(MAKE) --no-print-directory guest runtime
 	@$(ROOT)/macos/build-app.sh \
+	  --configuration production \
 	  --dmg \
 	  --guest-dir "$(GUEST_DIST)" \
 	  --sign-identity "$(PACKAGE_SIGN_IDENTITY)" \
@@ -127,13 +167,9 @@ release-preflight:
 	@[[ "$(RELEASE_SIGN_IDENTITY)" == "Developer ID Application:"* ]] || { echo 'error: RELEASE_SIGN_IDENTITY must be a Developer ID Application identity' >&2; exit 1; }
 	@[[ -n "$(strip $(RELEASE_NOTARY_PROFILE))" ]] || { echo 'error: RELEASE_NOTARY_PROFILE must name a notarytool keychain profile' >&2; exit 1; }
 
+release: export RELEASE_MAKE := $(MAKE)
 release: release-preflight
-	@$(MAKE) --no-print-directory guest runtime
-	@$(ROOT)/macos/build-app.sh \
-	  --dmg \
-	  --guest-dir "$(GUEST_DIST)" \
-	  --sign-identity "$(RELEASE_SIGN_IDENTITY)" \
-	  --notarize-profile "$(RELEASE_NOTARY_PROFILE)"
+	@python3 "$(ROOT)/scripts/release.py" --root "$(ROOT)"
 
 clean:
 	@echo 'Removing repository build output and caches...'
@@ -186,8 +222,12 @@ clean-all:
 	  cache="$$user_home/Library/Caches/dev.tryomarchy.native"; \
 	  preferences="$$user_home/Library/Preferences/dev.tryomarchy.native.plist"; \
 	  saved_state="$$user_home/Library/Saved Application State/dev.tryomarchy.native.savedState"; \
+	  development_cache="$$user_home/Library/Caches/dev.tryomarchy.native.development"; \
+	  development_preferences="$$user_home/Library/Preferences/dev.tryomarchy.native.development.plist"; \
+	  development_saved_state="$$user_home/Library/Saved Application State/dev.tryomarchy.native.development.savedState"; \
 	  echo "Removing persistent VM disks and app state from $$app_support..."; \
-	  rm -rf -- "$$app_support" "$$cache" "$$preferences" "$$saved_state"
+	  rm -rf -- "$$app_support" "$$cache" "$$preferences" "$$saved_state" \
+	    "$$development_cache" "$$development_preferences" "$$development_saved_state"
 	@user_id=$$(id -u); \
 	  find /private/tmp -maxdepth 1 -user "$$user_id" \
 	    \( -name 'omarchy-qemu-source-build.*' \

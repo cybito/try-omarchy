@@ -4,16 +4,41 @@ Thanks for helping improve Try Omarchy. The project has one product target: a
 native Apple Silicon macOS app that runs pinned upstream Omarchy in a
 project-built ARM64 virtual machine image.
 
-## Before opening a pull request
+## Pull requests
 
-1. Open an issue for large behavioral or architecture changes.
-2. Keep changes within the current Apple Silicon, QEMU/HVF, and ARM64 guest
-   architecture unless an architecture change has been discussed first.
-3. Run `make test`.
-4. If build inputs changed, run the relevant component build and explain how
-   its pinned versions or checksums were reviewed.
-5. Update documentation when commands, requirements, output paths, or security
-   boundaries change.
+Small fixes and documentation improvements are welcome without an issue first.
+For large behavioral or architecture changes, open an issue to discuss the idea
+before starting work.
+
+Keep each PR focused and explain what changed, why, and how you tested it. Run
+relevant tests when you can (`make test` runs the full suite on macOS), and say
+what you could not check. Documentation-only changes do not need an app build
+or the full test suite. Screenshots or a short video are helpful when they make
+UI changes easier to review.
+
+Update documentation when usage or requirements change. If you change build
+inputs, review their pins and checksums and run the relevant component build;
+explain any validation you could not complete. See the details below.
+
+## Reporting issues
+
+Before opening a report or proposal, search open and closed issues for the same
+problem or idea. Add useful details to an existing issue, or link related issues
+in your new report.
+
+Tell us what happened, what you expected, and whether it happens in the Mac app
+or inside Omarchy. Include your app version, macOS version, Apple chip, and
+steps to reproduce if known. Logs, screenshots, and recordings are optional;
+remove secrets and unrelated personal information before sharing them.
+
+You can open a report even if you cannot reliably reproduce the problem or do
+not know every system detail. For change proposals, describe the problem and
+what you would like to improve; a full implementation plan is not needed.
+
+Report suspected vulnerabilities through [SECURITY.md](SECURITY.md), not public
+issues. Coding agents should also read [AGENTS.md](AGENTS.md).
+
+## Build inputs and local state
 
 The guest and QEMU supply chains are deliberately pinned. Do not update a URL,
 commit, package lock, archive, or checksum independently of its associated
@@ -35,7 +60,7 @@ Pin an official upstream release, refresh the complete ARM64 transaction lock,
 and verify the source contract with one command:
 
 ```sh
-make update-omarchy OMARCHY_RELEASE=4.0.3
+make update-omarchy OMARCHY_RELEASE=4.0.4
 ```
 
 The command keeps a complete shallow source checkout under `.build/upstream/`,
@@ -54,6 +79,17 @@ version even for an official tag, so never hand-edit the `version` or `release`
 fields to make them agree; they record different upstream identities.
 
 ## Tests
+
+`make test` runs the complete suite with up to four independent suites at once.
+The Swift build and tests finish before any shell suite uses the native helper.
+Use `make test TEST_JOBS=1` for serial output when debugging, or set `TEST_JOBS`
+to another positive integer to bound concurrency. Individual groups are available
+as `make test-contracts`, `make test-guest`, `make test-swift`, and
+`make test-shell`; `make test-resize` runs the disk resize integration tests.
+
+PR checks run all tests and full runtime builds in separate, concurrent jobs on
+both macOS 15 and 26, labeled `Tests` and `Build`. No suites or runtime checks
+are skipped based on changed paths or cached test results.
 
 Tests should describe a user-visible behavior, policy, data contract, or
 process boundary. Keep presentation and edit rules in deterministic models that

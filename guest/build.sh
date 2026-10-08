@@ -79,10 +79,28 @@ for command in pacstrap arch-chroot curl git gzip python3 mke2fs mount umount re
   command -v "$command" >/dev/null || fail "$command is required; use the supplied Arch builder container"
 done
 
+# Bootstrap Omarchy's package signing key from the same reviewed packaging
+# commit as the builder. Fresh builds must not depend on a public keyserver.
+(
+  cd "$guest_dir/keys"
+  sha256sum -c <<'KEYRING_SUMS'
+15d6aac44df688165b2ea35fe0b23af239bbc66a6909c10a5c219e8d94b707de  omarchy.gpg
+ab0b688815444cffd48d15ca3597c77dbb364d59763c5784fca36691520f00fd  omarchy-trusted
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  omarchy-revoked
+KEYRING_SUMS
+)
+install -m 0644 "$guest_dir/keys/omarchy.gpg" "$guest_dir/keys/omarchy-trusted" \
+  "$guest_dir/keys/omarchy-revoked" /usr/share/pacman/keyrings/
+pacman-key --populate omarchy
+
 output=$(mkdir -p "$output" && cd "$output" && pwd)
 work=$(mkdir -p "$work" && cd "$work" && pwd)
 if [[ -z $source_dir ]]; then
-  source_dir="$work/omarchy-source"
+  # Keep each pin separate: a release update must not reuse or rewrite the
+  # previous release's checkout in the persistent build cache.
+  source_commit=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["upstream"]["commit"])' "$spec")
+  [[ $source_commit =~ ^[0-9a-f]{40}$ ]] || fail "invalid upstream commit"
+  source_dir="$work/omarchy-source-$source_commit"
   "$guest_dir/scripts/fetch-source.sh" --destination "$source_dir" --spec "$spec"
 else
   source_dir=$(cd "$source_dir" && pwd)
@@ -91,7 +109,6 @@ fi
 root=$(mktemp -d "$work/rootfs.XXXXXX")
 resolution_db=$(mktemp -d "$work/pacman-db.XXXXXX")
 pinned_repo=""
-abi_pin_repo=""
 chmod 0755 "$resolution_db"
 cleanup() {
   if (( keep_rootfs )); then
@@ -102,9 +119,6 @@ cleanup() {
   rm -rf "$resolution_db"
   if [[ -n $pinned_repo ]]; then
     rm -rf "$pinned_repo"
-  fi
-  if [[ -n $abi_pin_repo ]]; then
-    rm -rf "$abi_pin_repo"
   fi
 }
 trap cleanup EXIT
@@ -166,30 +180,17 @@ if ((${#pinned_records[@]})); then
     "$pinned_repo/"*.pkg.tar.zst >/dev/null
 fi
 
-# Guest pacman.conf is installed unchanged by configure-rootfs. The builder copy
-# may add reviewed ABI pins (packages mirrors no longer publish) and must drop
-# those names from IgnorePkg so the empty-root transaction can install them once.
-abi_pin_count=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("inputs", {}).get("abiPackagePins", [])))' "$spec")
+# Guest update holds are omitted from the builder's empty-root transaction,
+# which must match the reviewed package lock before installation.
 builder_conf_args=(
   python3 "$guest_dir/scripts/write-builder-pacman-conf.py"
   --spec "$spec"
-  --guest-dir "$guest_dir"
   --guest-config "$upstream_pacman_config"
-  --package-lock "$package_lock_file"
   --output "$pacman_config"
   --package-cache "$package_cache"
 )
 if [[ ${OMARCHY_PACMAN_DISABLE_SANDBOX:-0} == "1" ]]; then
   builder_conf_args+=(--disable-sandbox)
-fi
-if (( abi_pin_count > 0 )); then
-  abi_pin_repo=$(mktemp -d "$work/abi-pin-repo.XXXXXX")
-  "$guest_dir/scripts/build-pinned-abi-packages.sh" \
-    --spec "$spec" \
-    --guest-dir "$guest_dir" \
-    --output-repo "$abi_pin_repo" \
-    --work "$work" || fail "could not rebuild the reviewed ABI pins"
-  builder_conf_args+=(--abi-repo "$abi_pin_repo")
 fi
 if [[ -n $pinned_repo ]]; then
   builder_conf_args+=(--pinned-cache-repo "$pinned_repo")
@@ -222,6 +223,11 @@ python3 "$guest_dir/scripts/resolve-package-lock.py" \
   ln -sfn /proc/self/fd/1 "$dev_root/stdout"
   ln -sfn /proc/self/fd/2 "$dev_root/stderr"
 )
+
+# Keep a fresh guest-local keypair while seeding the reviewed repository keys
+# before the initial transaction verifies the keyring packages themselves.
+pacman-key --gpgdir "$root/etc/pacman.d/gnupg" --init
+pacman-key --gpgdir "$root/etc/pacman.d/gnupg" --populate archlinuxarm omarchy
 
 # pacstrap reads configured CacheDir paths for host-cache mode only with -P.
 # The copied builder config is replaced by configure-rootfs below. Archives
@@ -279,6 +285,11 @@ python3 "$guest_dir/scripts/apply-omarchy-backports.py" --root "$root" --spec "$
   --spec "$spec" \
   --pacman-config "$pacman_config"
 "$guest_dir/scripts/register-pinned-voxtype.sh" \
+  --root "$root" \
+  --work "$work" \
+  --spec "$spec" \
+  --pacman-config "$pacman_config"
+"$guest_dir/scripts/register-native-battery-module.sh" \
   --root "$root" \
   --work "$work" \
   --spec "$spec" \

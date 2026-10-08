@@ -14,9 +14,11 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from unittest.mock import patch
 
 
 REPOSITORY = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPOSITORY / "scripts"))
 SPEC = importlib.util.spec_from_file_location(
     "try_omarchy_build_cache", REPOSITORY / "scripts/build-cache.py"
 )
@@ -82,6 +84,64 @@ FAKE_GUEST_BUILDER = textwrap.dedent(
 
 
 class BuildCacheTests(unittest.TestCase):
+    def test_app_fingerprint_tracks_migration_catalog_and_reviewed_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            migrations = root / "guest/migrations"
+            migrations.mkdir(parents=True)
+            for name in ("catalog.json", "preimages.json"):
+                (migrations / name).write_text("initial\n")
+            for path in build_cache.component_files(root, "app"):
+                if not path.exists():
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("fixture\n")
+            with patch.object(build_cache, "context", return_value={}), \
+                    patch.object(build_cache, "build_version", return_value={}), \
+                    patch.object(build_cache, "app_external_files", return_value=[]):
+                previous = build_cache.fingerprint(root, "app", ["build-app"])
+                for name in ("catalog.json", "preimages.json"):
+                    (migrations / name).write_text("updated\n")
+                    current = build_cache.fingerprint(root, "app", ["build-app"])
+                    self.assertNotEqual(previous, current, name)
+                    previous = current
+
+    def test_app_fingerprint_tracks_bundled_battery_module_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            module = root / "guest/native-module/try-omarchy-battery"
+            module.mkdir(parents=True)
+            for name in ("try-omarchy-battery.c", "Makefile", "dkms.conf"):
+                (module / name).write_text("initial\n")
+            for path in build_cache.component_files(root, "app"):
+                if not path.exists():
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("fixture\n")
+            with patch.object(build_cache, "context", return_value={}), \
+                    patch.object(build_cache, "build_version", return_value={}), \
+                    patch.object(build_cache, "app_external_files", return_value=[]):
+                previous = build_cache.fingerprint(root, "app", ["build-app"])
+                for name in ("try-omarchy-battery.c", "Makefile", "dkms.conf"):
+                    (module / name).write_text("updated\n")
+                    current = build_cache.fingerprint(root, "app", ["build-app"])
+                    self.assertNotEqual(previous, current, name)
+                    previous = current
+
+    def test_runtime_fingerprint_tracks_compiled_graphics_regressions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            regression = root / "macos/Tests/virgl/test-multisample-formats.c"
+            regression.parent.mkdir(parents=True)
+            regression.write_text("initial graphics regression\n")
+            for path in build_cache.component_files(root, "runtime"):
+                if not path.exists():
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("fixture\n")
+            with patch.object(build_cache, "context", return_value={}):
+                previous = build_cache.fingerprint(root, "runtime", ["build-runtime"])
+                regression.write_text("updated graphics regression\n")
+                current = build_cache.fingerprint(root, "runtime", ["build-runtime"])
+            self.assertNotEqual(previous, current)
+
     @staticmethod
     def prepare_fake_guest(root: Path) -> None:
         (root / "guest").mkdir()
@@ -150,10 +210,11 @@ class BuildCacheTests(unittest.TestCase):
         manifest = REPOSITORY / "macos/runtime-files.txt"
         expected = frozenset(manifest.read_text(encoding="ascii").splitlines())
         self.assertEqual(expected, build_cache.RUNTIME_FILES)
-        self.assertEqual(16, len(expected))
+        self.assertEqual(17, len(expected))
         self.assertIn("bin/qemu-system-aarch64", expected)
         self.assertIn("bin/zstd", expected)
         self.assertIn("lib/libSDL3.dylib", expected)
+        self.assertIn("lib/libusb-1.0.0.dylib", expected)
 
         with tempfile.TemporaryDirectory() as temporary:
             invalid = Path(temporary) / "runtime-files.txt"
@@ -261,6 +322,67 @@ class BuildCacheTests(unittest.TestCase):
                 build_cache.CacheError, "app bundle is missing or unsafe"
             ):
                 build_cache.validate_app(root, None)
+
+    def test_app_fingerprint_tracks_git_version_without_source_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for relative in (
+                "macos/Info.plist", "LICENSE", ".build/state/guest.json",
+                ".build/state/runtime.json", "dist/guest/guest-manifest.json",
+                "dist/guest/SHA256SUMS",
+                "guest/scripts/install-settings-integration.py",
+                "guest/native-overlay/usr/local/bin/omarchy-native-settings",
+                "guest/native-overlay/etc/udev/rules.d/92-omarchy-native-settings.rules",
+                "guest/native-overlay/usr/share/applications/try-omarchy-settings.desktop",
+                "guest/native-overlay/etc/skel/.config/omarchy/extensions/omarchy-menu.jsonc",
+                *(f"macos/.build/qemu-gpu-runtime/{name}" for name in build_cache.RUNTIME_FILES),
+            ):
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("fixture\n")
+            (root / ".gitignore").write_text("/dist/\n/.build/\n/macos/.build/\n")
+
+            def git(*arguments: str) -> None:
+                subprocess.run(
+                    ["git", "-C", str(root), *arguments],
+                    check=True, capture_output=True,
+                )
+
+            git("init", "-q")
+            git("config", "user.name", "Cache Tests")
+            git("config", "user.email", "cache-tests@example.invalid")
+            git("add", ".")
+            git("commit", "-qm", "Initial source")
+
+            def fingerprint() -> str:
+                return build_cache.fingerprint(root, "app", ["build-app"])
+
+            untagged = fingerprint()
+            git("tag", "v1.2.3")
+            tagged = fingerprint()
+            self.assertNotEqual(untagged, tagged)
+
+            # A file outside the app inputs still makes its version dirty.
+            untracked = root / "notes.txt"
+            untracked.write_text("untracked\n")
+            dirty = fingerprint()
+            self.assertNotEqual(tagged, dirty)
+            untracked.unlink()
+            self.assertEqual(tagged, fingerprint())
+
+            source = root / "macos/Info.plist"
+            source.write_text("edited\n")
+            dirty = fingerprint()
+            git("add", ".")
+            git("commit", "-qm", "Edit source")
+            committed = fingerprint()
+            self.assertNotEqual(dirty, committed)
+
+            git("commit", "--allow-empty", "-qm", "Advance HEAD")
+            self.assertNotEqual(committed, fingerprint())
+            stable = fingerprint()
+            (root / "dist/build-log").write_text("ignored output\n")
+            self.assertEqual(stable, fingerprint())
 
     def test_state_write_is_readable_and_replaces_old_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

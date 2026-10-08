@@ -14,12 +14,14 @@ enum QEMUGPURuntimeEnvironment {
     static let inspectOnlyKey = "OMARCHY_QEMU_GPU_INSPECT_ONLY"
     static let dryRunKey = "OMARCHY_QEMU_GPU_DRY_RUN"
     static let bootRecoveryConsentKey = "OMARCHY_QEMU_GPU_ALLOW_BOOT_RECOVERY"
+    static let guestFixesConsentKey = "OMARCHY_QEMU_GPU_GUEST_FIXES_CONSENT"
 
     static func sanitizedForLaunch(_ base: [String: String]) -> [String: String] {
         var environment = base
         environment.removeValue(forKey: inspectOnlyKey)
         environment.removeValue(forKey: dryRunKey)
         environment.removeValue(forKey: bootRecoveryConsentKey)
+        environment.removeValue(forKey: guestFixesConsentKey)
         return environment
     }
 
@@ -36,9 +38,11 @@ enum QEMUGPURuntimeEnvironment {
             AudioLaunchConfiguration.outputDeviceNameKey,
             AudioLaunchConfiguration.inputDeviceNameKey,
             SharedFolderPolicy.environmentKey,
+            USBPassthroughPolicy.environmentKey,
             PortForwardPolicy.environmentKey,
             VMResourceLaunchConfiguration.cpuEnvironmentKey,
             VMResourceLaunchConfiguration.memoryEnvironmentKey,
+            VMResourceLaunchConfiguration.diskEnvironmentKey,
         ] {
             environment.removeValue(forKey: key)
         }
@@ -191,6 +195,16 @@ enum QEMUGPUStorageSpaceEstimate {
         bundleIdentity: String? = nil,
         fileManager: FileManager = .default
     ) -> Bool {
+        recordedPersistentDiskURL(stateRoot: stateRoot, bundleIdentity: bundleIdentity, fileManager: fileManager) != nil
+    }
+
+    /// Selects the disk before legacy-directory migration so first-launch
+    /// consent follows the same inode after the launcher renames its directory.
+    static func recordedPersistentDiskURL(
+        stateRoot: String,
+        bundleIdentity: String? = nil,
+        fileManager: FileManager = .default
+    ) -> URL? {
         let disks = URL(fileURLWithPath: stateRoot, isDirectory: true)
             .appendingPathComponent("disks", isDirectory: true)
         guard hasAttributes(
@@ -204,13 +218,56 @@ enum QEMUGPUStorageSpaceEstimate {
                 includingPropertiesForKeys: nil,
                 options: []
               )
-        else { return false }
+        else { return nil }
 
-        return selectedSinglePersistentDisk(
+        guard let selected = selectedSinglePersistentDisk(
             from: contents,
             bundleIdentity: bundleIdentity,
             fileManager: fileManager
-        )?.schemaVersion == 2
+        ), selected.schemaVersion == 2 else { return nil }
+        return selected.disk
+    }
+
+    /// Capability follows the selected disk's saved boot kit, not the current
+    /// app version. The launcher checks it again after locking the workspace.
+    static func supportsLanguageSelection(
+        environment: [String: String],
+        metrics: BundledGuestMetrics?,
+        preference: StorageLocationPreference = .default,
+        fileManager: FileManager = .default
+    ) -> Bool {
+        guard let metrics,
+              let root = storageRootURL(environment: environment, preference: preference, fileManager: fileManager)
+        else { return false }
+        let disks = root.appendingPathComponent("disks", isDirectory: true)
+        if !fileManager.fileExists(atPath: disks.path) {
+            return metrics.supportsLanguageSelection
+        }
+        guard hasAttributes(disks, type: .typeDirectory, permissions: 0o700, fileManager: fileManager),
+              let entries = try? fileManager.contentsOfDirectory(at: disks, includingPropertiesForKeys: nil)
+        else { return false }
+        let selected: RecordedPersistentDisk?
+        if environment["OMARCHY_QEMU_GPU_DEVELOPMENT_MULTI_DISK"] == "1" {
+            let directory = disks.appendingPathComponent(metrics.identity)
+            if !fileManager.fileExists(atPath: directory.path) { return metrics.supportsLanguageSelection }
+            selected = recordedPersistentDisk(in: directory, fileManager: fileManager)
+        } else {
+            if entries.isEmpty { return metrics.supportsLanguageSelection }
+            selected = selectedSinglePersistentDisk(from: entries, bundleIdentity: metrics.identity, fileManager: fileManager)
+        }
+        guard let selected, selected.schemaVersion == 2 else { return false }
+        if selected.identity == metrics.identity { return metrics.supportsLanguageSelection }
+        let boot = root.appendingPathComponent("boot", isDirectory: true)
+        let kit = boot.appendingPathComponent(selected.identity, isDirectory: true)
+        let commandLine = kit.appendingPathComponent("command-line")
+        guard hasAttributes(boot, type: .typeDirectory, permissions: 0o700, fileManager: fileManager),
+              hasAttributes(kit, type: .typeDirectory, permissions: 0o700, fileManager: fileManager),
+              hasAttributes(commandLine, type: .typeRegular, permissions: 0o600, fileManager: fileManager),
+              let size = try? commandLine.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+              size <= 16385,
+              let contents = try? String(contentsOf: commandLine, encoding: .utf8)
+        else { return false }
+        return GuestLocaleCatalog.supportsSelection(kernelCommandLine: contents)
     }
 
     /// Read-only best-effort preflight for the one-time legacy boot-file
@@ -301,7 +358,10 @@ enum QEMUGPUStorageSpaceEstimate {
         return BundledGuestMetrics(
             identity: identity,
             sourceDiskBytes: Int64(sourceBytes),
-            workingDiskBytes: Int64(workingBytes)
+            workingDiskBytes: Int64(workingBytes),
+            supportsLanguageSelection: GuestLocaleCatalog.supportsSelection(
+                kernelCommandLine: dictionary["kernelCommandLine"] as? String ?? ""
+            )
         )
     }
 
@@ -725,6 +785,8 @@ enum CameraPreflight {
 final class QEMUGPUProcessSupervisor: @unchecked Sendable {
     enum LaunchEvent: Equatable {
         case virtualMachineReady(qmpSocketPath: String?)
+        case resetProgress(VMResetPhase)
+        case launchProgress(VMLaunchPhase)
     }
 
     struct StandardErrorDrain {
@@ -745,6 +807,8 @@ final class QEMUGPUProcessSupervisor: @unchecked Sendable {
     private var errorPipe: Pipe?
     private var errorBuffer = ""
     private var didReportVirtualMachineStart = false
+    private var resetProgressStream: VMProgressStream<VMResetPhase>?
+    private var launchProgressStream: VMProgressStream<VMLaunchPhase>?
 
     func start(
         executableURL: URL,
@@ -812,6 +876,9 @@ final class QEMUGPUProcessSupervisor: @unchecked Sendable {
         errorPipe = pipe
         errorBuffer = ""
         didReportVirtualMachineStart = false
+        let isReset = arguments.first == QEMUGPUStorageOption.resetStorageOnly.rawValue
+        resetProgressStream = isReset ? VMProgressStream(operation: .reset) : nil
+        launchProgressStream = isReset ? nil : VMProgressStream(operation: .launch)
         lock.unlock()
 
         do {
@@ -951,7 +1018,8 @@ final class QEMUGPUProcessSupervisor: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         errorBuffer += String(decoding: data, as: UTF8.self)
-        var launchEvents: [LaunchEvent] = []
+        var launchEvents = (resetProgressStream?.append(data) ?? []).map(LaunchEvent.resetProgress)
+        launchEvents += (launchProgressStream?.append(data) ?? []).map(LaunchEvent.launchProgress)
         if !didReportVirtualMachineStart,
            let event = Self.virtualMachineReadyEvent(in: errorBuffer) {
             didReportVirtualMachineStart = true

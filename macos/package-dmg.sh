@@ -48,7 +48,7 @@ output=${2:-"${app%.app}.dmg"}
 [[ $output == /* && $output == *.dmg ]] || fail "OUTPUT_DMG must be an absolute .dmg path"
 [[ ! -e $output && ! -L $output ]] || fail "output already exists: $output"
 
-for tool in codesign ditto hdiutil ln mkdir mktemp osascript rm sync; do
+for tool in codesign diskutil ditto hdiutil ln mkdir mktemp osascript rm sync; do
   command -v "$tool" >/dev/null 2>&1 || fail "required tool is unavailable: $tool"
 done
 codesign --verify --deep --strict --verbose=2 "$app"
@@ -61,7 +61,8 @@ layout_source="$native_dir/dmg-layout.applescript"
 
 work_dir=$(mktemp -d /private/tmp/omarchy-dmg.XXXXXX)
 mounted=0
-mount_dir="$work_dir/mount"
+working_volume_name="Try Omarchy ${work_dir##*/}"
+mount_dir="$work_dir/$working_volume_name"
 cleanup() {
   status=$?
   trap - EXIT HUP INT TERM
@@ -84,7 +85,7 @@ ln -s /Applications "$staging/Applications"
 
 read_write_dmg="$work_dir/Omarchy-rw.dmg"
 hdiutil create \
-  -volname "Try Omarchy" \
+  -volname "$working_volume_name" \
   -srcfolder "$staging" \
   -fs APFS \
   -format UDRW \
@@ -101,6 +102,9 @@ mounted=1
 
 osascript "$layout_source" "$mount_dir" "${app##*/}"
 
+# Finder references can use volume and window names. Keep both the volume
+# label and mount folder distinct until Finder has finished arranging it.
+diskutil rename "$mount_dir" "Try Omarchy" >/dev/null
 sync
 hdiutil detach "$mount_dir" >/dev/null
 mounted=0

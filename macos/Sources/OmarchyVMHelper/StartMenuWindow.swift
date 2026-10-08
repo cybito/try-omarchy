@@ -160,17 +160,33 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
     private let sharedFolderStatus: () -> SharedFolderMenuState
     private let chooseSharedFolder: (String) -> String?
     private let setSharedFolderEnabled: (Bool) -> Void
+    private let usbDeviceStatus: () -> USBDeviceMenuState
+    private let connectedUSBDevices: () -> [USBDeviceIdentity]
+    private let saveUSBDevice: (USBDevicePreference) -> Void
     private let portForwardingStatus: () -> [PortForwardMapping]
     private let savePortForwarding: ([PortForwardMapping]) -> String?
     private let resources: () -> VMResources
+    private let minimumDiskGiB: () -> Int
     private let resourceLimits: VMResourceLimits
     private let saveResources: (VMResources) -> Void
     private let networkPreferences: () -> VMNetworkPreferences
     private let saveNetworkPreferences: (VMNetworkPreferences) -> String?
+    private let networkIdentity: VMNetworkIdentityAccess
     private var networkEditor: NetworkEditor?
     private let immersiveMode: () -> Bool
     private let setImmersiveMode: (Bool) -> Void
+    private let startAutomatically: () -> Bool
+    private let setStartAutomatically: (Bool) -> String?
+    private let presentStartupSaveError: (NSAlert, NSWindow) -> Void
+    private let confirmAutomaticStartup: (NSAlert) -> NSApplication.ModalResponse
+    private let bootFixCacheURL: () -> URL?
+    private let bootFixIdentity: () -> String?
+    private let retryBootFixes: () -> Void
     private let launch: () -> Void
+    private let appVersionLabel: String
+    private let appReleaseActionTitle: () -> String
+    private let checkForAppUpdates: () -> Void
+    private weak var appReleaseButton: NSButton?
     private let canResetStorage: Bool
     private let storageLocation: () -> String?
     private let storageLocationURL: () -> URL?
@@ -182,50 +198,43 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
     private var microphoneRequestInFlight = false
     private var cameraRequestInFlight = false
     private var resetInProgress = false
+    private var resetPhase = VMResetPhase.checking
+    private weak var resetActionButton: OmarchyActionButton?
     private var launchInProgress = false
+    private var launchPhase = VMLaunchPhase.checking
+    private weak var launchActionButton: OmarchyActionButton?
+    private var virtualMachineRunning = false
+    private var closeRunningSettings: (() -> Void)?
+    private var shutdownInProgress = false
+    private var requestSettingsAction: ((VMRunLifecycle.SettingsAction) -> Void)?
+    private var automaticStartupConfirmationInProgress = false
+    private var controlsBusy: Bool {
+        launchInProgress || shutdownInProgress || automaticStartupConfirmationInProgress
+    }
+    var onAppReleasePromptOpportunity: (() -> Void)?
+    var canPresentAppReleasePrompt: Bool {
+        window.isKeyWindow && !controlsBusy && !resetInProgress
+            && !microphoneRequestInFlight && !cameraRequestInFlight
+            && window.attachedSheet == nil && networkEditor == nil
+            && portForwardingEditor == nil && resourceEditor == nil && usbDeviceEditor == nil
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        onAppReleasePromptOpportunity?()
+    }
+    private var prelaunchControlsLocked: Bool { controlsBusy || virtualMachineRunning }
     private var pendingResetSpaceEstimate: String?
     private var resetConfirmationPrompt: ResetConfirmationPrompt?
     private weak var startMenuScrollView: NSScrollView?
+    private var preferredContentHeight: CGFloat = 832
     private(set) var portForwardingEditor: PortForwardingEditor?
     private(set) var resourceEditor: VMResourceEditor?
+    private(set) var usbDeviceEditor: USBDeviceEditor?
     private weak var immersiveCaption: NSTextField?
-    private lazy var permissionWindowRestorer = PermissionWindowRestorer(
-        canRestore: { [weak self] in
-            guard let self else { return false }
-            return self.window.isVisible
-                && !self.launchInProgress
-                && !self.resetInProgress
-                && !self.microphoneRequestInFlight
-                && !self.cameraRequestInFlight
-                && self.window.attachedSheet == nil
-                && NSApp.modalWindow == nil
-                && self.portForwardingEditor == nil
-                && self.resourceEditor == nil
-        },
-        isApplicationActive: { NSApp.isActive },
-        orderFrontRegardless: { [weak self] frame in
-            guard let self else { return }
-            self.window.setFrame(frame, display: false)
-            self.window.orderFrontRegardless()
-        },
-        activateApplication: {
-            // `activate(ignoringOtherApps:)` is deprecated on the deployment
-            // target. The system permission UI cooperatively yields to this
-            // modern activation request as it closes.
-            NSApp.activate()
-        },
-        makeKeyAndOrderFront: { [weak self] frame in
-            guard let self else { return }
-            self.window.setFrame(frame, display: false)
-            self.window.makeKeyAndOrderFront(nil)
-        },
-        retryDelays: [0.1, 0.3],
-        schedule: { delay, action in
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                action()
-            }
-        }
-    )
+    private var accessibilityRow: StartMenuPermissionRow?
+    private var microphoneRow: StartMenuPermissionRow?
+    private var cameraRow: StartMenuPermissionRow?
+    private var permissionDisabledButtons: [(NSButton, Bool)] = []
 
     init(
         accessibilityStatus: @escaping () -> Bool,
@@ -248,15 +257,30 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
         sharedFolderStatus: @escaping () -> SharedFolderMenuState,
         chooseSharedFolder: @escaping (String) -> String?,
         setSharedFolderEnabled: @escaping (Bool) -> Void,
+        usbDeviceStatus: @escaping () -> USBDeviceMenuState = { .disabled },
+        connectedUSBDevices: @escaping () -> [USBDeviceIdentity] = { [] },
+        saveUSBDevice: @escaping (USBDevicePreference) -> Void = { _ in },
         portForwardingStatus: @escaping () -> [PortForwardMapping] = { [] },
         savePortForwarding: @escaping ([PortForwardMapping]) -> String? = { _ in nil },
         resources: @escaping () -> VMResources = { VMResourceLimits.current.defaults },
         resourceLimits: VMResourceLimits = .current,
+        minimumDiskGiB: @escaping () -> Int = { 1 },
         saveResources: @escaping (VMResources) -> Void = { _ in },
         networkPreferences: @escaping () -> VMNetworkPreferences = { VMNetworkPreferences() },
         saveNetworkPreferences: @escaping (VMNetworkPreferences) -> String? = { _ in nil },
+        networkIdentity: VMNetworkIdentityAccess = .unavailable,
         immersiveMode: @escaping () -> Bool = { true },
         setImmersiveMode: @escaping (Bool) -> Void = { _ in },
+        startAutomatically: @escaping () -> Bool = { false },
+        setStartAutomatically: @escaping (Bool) -> String? = { _ in nil },
+        presentStartupSaveError: @escaping (NSAlert, NSWindow) -> Void = { $0.beginSheetModal(for: $1) },
+        confirmAutomaticStartup: @escaping (NSAlert) -> NSApplication.ModalResponse = { $0.runModal() },
+        appVersionLabel: String = InstalledAppRelease.current.label,
+        appReleaseActionTitle: @escaping () -> String = { "Check for Updates…" },
+        checkForAppUpdates: @escaping () -> Void = {},
+        bootFixCacheURL: @escaping () -> URL? = { nil },
+        bootFixIdentity: @escaping () -> String? = { GuestBootFixCache.bundledIdentity },
+        retryBootFixes: @escaping () -> Void = {},
         launch: @escaping () -> Void
     ) {
         self.accessibilityStatus = accessibilityStatus
@@ -277,20 +301,35 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
         self.sharedFolderStatus = sharedFolderStatus
         self.chooseSharedFolder = chooseSharedFolder
         self.setSharedFolderEnabled = setSharedFolderEnabled
+        self.usbDeviceStatus = usbDeviceStatus
+        self.connectedUSBDevices = connectedUSBDevices
+        self.saveUSBDevice = saveUSBDevice
         self.portForwardingStatus = portForwardingStatus
         self.savePortForwarding = savePortForwarding
         self.resources = resources
+        self.minimumDiskGiB = minimumDiskGiB
         self.resourceLimits = resourceLimits
         self.saveResources = saveResources
         self.networkPreferences = networkPreferences
         self.saveNetworkPreferences = saveNetworkPreferences
+        self.networkIdentity = networkIdentity
         self.immersiveMode = immersiveMode
         self.setImmersiveMode = setImmersiveMode
+        self.startAutomatically = startAutomatically
+        self.setStartAutomatically = setStartAutomatically
+        self.presentStartupSaveError = presentStartupSaveError
+        self.confirmAutomaticStartup = confirmAutomaticStartup
+        self.bootFixCacheURL = bootFixCacheURL
+        self.bootFixIdentity = bootFixIdentity
+        self.retryBootFixes = retryBootFixes
         self.launch = launch
+        self.appVersionLabel = appVersionLabel
+        self.appReleaseActionTitle = appReleaseActionTitle
+        self.checkForAppUpdates = checkForAppUpdates
 
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 600, height: 832),
-            styleMask: [.titled, .closable, .fullSizeContentView],
+            styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
@@ -303,6 +342,60 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
         window.contentView = content
     }
 
+    func virtualMachineDidStart(
+        requestSettingsAction: @escaping (VMRunLifecycle.SettingsAction) -> Void = { _ in },
+        closeSettings: @escaping () -> Void
+    ) {
+        launchInProgress = false
+        virtualMachineRunning = true
+        closeRunningSettings = closeSettings
+        self.requestSettingsAction = requestSettingsAction
+        window.title = "Try Omarchy Settings"
+        // The VM has its own Cocoa process and may occupy a fullscreen Space.
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        window.level = .floating
+    }
+
+    func shutdownDidBegin() {
+        shutdownInProgress = true
+        render()
+    }
+
+    func shutdownDidFail(_ message: String) {
+        shutdownInProgress = false
+        render()
+        let alert = NSAlert()
+        alert.messageText = "Omarchy couldn’t shut down"
+        alert.informativeText = message
+        alert.beginSheetModal(for: window)
+    }
+
+    @objc private func restartOmarchy() { requestShutdown(.restart) }
+    @objc private func shutDownToManage() { requestShutdown(.manage) }
+
+    private func requestShutdown(_ action: VMRunLifecycle.SettingsAction) {
+        guard virtualMachineRunning, !controlsBusy,
+              !microphoneRequestInFlight, !cameraRequestInFlight,
+              window.attachedSheet == nil, portForwardingEditor == nil else { return }
+        let alert = NSAlert()
+        alert.messageText = action == .restart ? "Restart Try Omarchy?" : "Shut down Omarchy to manage this VM?"
+        alert.informativeText = action == .restart
+            ? "Save your work first. Omarchy will shut down and start again with your saved settings."
+            : "Save your work first. The settings window will stay open so you can change the VM location or reset it."
+        alert.addButton(withTitle: action == .restart ? "Restart" : "Shut Down")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            self?.requestSettingsAction?(action)
+        }
+    }
+
+    @objc private func closeSettings() {
+        guard virtualMachineRunning else { return }
+        dismiss()
+        closeRunningSettings?()
+    }
+
     func show() {
         prepareForPresentation(
             visibleFrame: (window.screen ?? NSScreen.main)?.visibleFrame
@@ -312,29 +405,118 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    /// Reuse the current view hierarchy so open editors keep their drafts.
+    func bringToFront() {
+        window.deminiaturize(nil)
+        window.makeKeyAndOrderFront(nil)
+        window.attachedSheet?.makeKeyAndOrderFront(nil)
+        NSApp.activate()
+    }
+
+    func refreshAppReleaseStatus() {
+        appReleaseButton?.title = appReleaseActionTitle()
+    }
+
+    func refreshBootFixStatus() { render() }
+
+    func confirmBootFixes() -> GuestBootFixChoice {
+        show()
+        guard let catalog = GuestBootFixCatalog.bundled else {
+            let alert = NSAlert()
+            alert.messageText = "VM update details are unavailable"
+            alert.informativeText = "The update catalog is missing or damaged. Reinstall Try Omarchy before updating this VM."
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return .cancel
+        }
+        return GuestBootFixLaunchGate.decide(review: {
+            switch GuestBootFixPrompt.review(catalog: catalog).runModal() {
+            case .alertFirstButtonReturn: return .update
+            case .alertSecondButtonReturn: return .skip
+            default: return .cancel
+            }
+        }, confirmSkip: {
+            GuestBootFixPrompt.skip().runModal() == .alertSecondButtonReturn
+        })
+    }
+
+    @objc private func showAppUpdates() { checkForAppUpdates() }
+
     func prepareForPresentation(visibleFrame: NSRect?) {
+        let scrollOffset = startMenuScrollView?.contentView.bounds.origin.y ?? 0
         render()
         if let visibleFrame {
-            // The resources row adds one 72pt row to the menu that previously
-            // fit at 760. At 690 the launch button cleared the bottom edge by
-            // 15pt, which any difference in system font metrics turned into a
-            // button clipped off the window; on displays shorter than the
-            // window the content scrolls rather than clips.
-            let availableHeight = max(480, visibleFrame.height - 32)
-            window.setContentSize(NSSize(width: 600, height: min(832, availableHeight)))
+            let availableContent = window.contentRect(
+                forFrameRect: visibleFrame.insetBy(dx: 0, dy: 16)
+            )
+            window.setContentSize(NSSize(
+                width: 600,
+                height: min(preferredContentHeight, max(1, availableContent.height))
+            ))
+            content.layoutSubtreeIfNeeded()
+            if let scrollView = startMenuScrollView, let document = scrollView.documentView {
+                let maximumOffset = max(0, document.frame.height - scrollView.contentView.bounds.height)
+                scrollView.contentView.scroll(to: NSPoint(x: 0, y: min(scrollOffset, maximumOffset)))
+                scrollView.reflectScrolledClipView(scrollView.contentView)
+            }
         }
     }
 
     func refreshPermissionStatus() {
-        guard window.isVisible, !launchInProgress, !resetInProgress else { return }
-        render()
+        guard accessibilityRow != nil, !controlsBusy, !resetInProgress else { return }
+        updatePermissionRows()
     }
 
     func applicationDidBecomeActive() {
+        // Returning from Settings or a system prompt must not rebuild the
+        // launcher, probe VM storage, or disturb an open sheet or its draft.
         refreshPermissionStatus()
-        // Refresh replaces the view hierarchy, so key/front restoration must
-        // be the final operation rather than something a render can disturb.
-        permissionWindowRestorer.applicationDidBecomeActive()
+    }
+
+    private func updatePermissionRows() {
+        let granted = accessibilityStatus()
+        accessibilityRow?.update(
+            StartMenuPermissionPresentation(
+                detail: "Needed for the native keyboard experience with Super shortcuts.",
+                isGranted: granted,
+                actionTitle: granted ? nil : "Open Settings",
+                action: .request
+            ),
+            action: #selector(beginAccessibilityRequest)
+        )
+        let microphone = StartMenuPresentation.microphone(
+            state: microphoneStatus(), requestInFlight: microphoneRequestInFlight
+        )
+        microphoneRow?.update(microphone, action: microphone.action == .openSettings
+            ? #selector(openMicrophoneSettings) : #selector(beginMicrophoneRequest))
+        let camera = StartMenuPresentation.camera(
+            state: cameraStatus(), requestInFlight: cameraRequestInFlight
+        )
+        cameraRow?.update(camera, action: camera.action == .openSettings
+            ? #selector(openCameraSettings) : #selector(beginCameraRequest))
+        updatePermissionRequestControls()
+    }
+
+    /// Preserve each control's own eligibility while a system prompt is open.
+    /// Rendering also uses this gate, so a refresh cannot strand disabled controls.
+    private func updatePermissionRequestControls() {
+        let waiting = microphoneRequestInFlight || cameraRequestInFlight
+        if waiting, permissionDisabledButtons.isEmpty {
+            func disableButtons(in view: NSView) {
+                if let button = view as? NSButton {
+                    permissionDisabledButtons.append((button, button.isEnabled))
+                    button.isEnabled = false
+                }
+                view.subviews.forEach { disableButtons(in: $0) }
+            }
+            disableButtons(in: content)
+        } else if !waiting {
+            for (button, wasEnabled) in permissionDisabledButtons {
+                button.isEnabled = wasEnabled
+            }
+            permissionDisabledButtons.removeAll()
+            onAppReleasePromptOpportunity?()
+        }
     }
 
     func promptForReset() {
@@ -344,7 +526,6 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
     }
 
     func dismiss() {
-        permissionWindowRestorer.cancel()
         resetConfirmationPrompt?.cancel(in: window)
         resetConfirmationPrompt = nil
         portForwardingEditor?.dismiss()
@@ -352,6 +533,36 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
         resourceEditor?.dismiss()
         resourceEditor = nil
         window.orderOut(nil)
+    }
+
+    func launchDidProgress(to phase: VMLaunchPhase) {
+        guard launchInProgress, launchPhase != phase else { return }
+        launchPhase = phase
+        launchActionButton?.updateTitle(phase.buttonTitle)
+        launchActionButton?.invalidateIntrinsicContentSize()
+        NSAccessibility.post(
+            element: window,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement: phase.buttonTitle,
+                .priority: NSAccessibilityPriorityLevel.medium.rawValue,
+            ]
+        )
+    }
+
+    func resetDidProgress(to phase: VMResetPhase) {
+        guard resetInProgress, resetPhase != phase else { return }
+        resetPhase = phase
+        resetActionButton?.updateTitle(phase.buttonTitle)
+        resetActionButton?.invalidateIntrinsicContentSize()
+        NSAccessibility.post(
+            element: window,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement: phase.buttonTitle,
+                .priority: NSAccessibilityPriorityLevel.medium.rawValue,
+            ]
+        )
     }
 
     func resetDidFinish(errorMessage: String?) {
@@ -366,11 +577,11 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
             alert.informativeText = errorMessage
         } else {
             alert.alertStyle = .informational
-            alert.messageText = "Omarchy has been reset"
+            alert.messageText = "Try Omarchy has been reset"
             if let estimate = pendingResetSpaceEstimate {
-                alert.informativeText = "The VM is back to factory settings. Up to \(estimate) of disk space was reclaimed. You can launch whenever you’re ready."
+                alert.informativeText = "The VM has been deleted. Up to \(estimate) of disk space was reclaimed. A fresh VM will be prepared on the next launch."
             } else {
-                alert.informativeText = "The VM is back to factory settings. You can launch whenever you’re ready."
+                alert.informativeText = "The VM has been deleted. A fresh VM will be prepared on the next launch."
             }
         }
         pendingResetSpaceEstimate = nil
@@ -383,13 +594,13 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
     func launchDidAbort() {
         guard launchInProgress else { return }
         launchInProgress = false
-        render()
+        show()
     }
 
     /// Clears the resetting state when the controller refused to start the
     /// reset at all. Deliberately silent, and deliberately not
     /// `resetDidFinish(errorMessage: nil)` — nothing was erased, so claiming
-    /// "Omarchy has been reset" would be a lie about a destructive action.
+    /// "Try Omarchy has been reset" would be a lie about a destructive action.
     func resetDidAbort() {
         guard resetInProgress else { return }
         resetInProgress = false
@@ -399,7 +610,7 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
     func launchRequiresReset() {
         guard launchInProgress else { return }
         launchInProgress = false
-        render()
+        show()
 
         let alert = NSAlert()
         alert.alertStyle = .warning
@@ -414,6 +625,7 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
     /// the gap between presenting the explanation and receiving the answer.
     func confirmBootRecovery() -> Bool {
         guard launchInProgress else { return false }
+        show()
         let alert = NSAlert()
         alert.alertStyle = .informational
         alert.messageText = StartMenuPresentation.bootRecoveryConfirmationTitle
@@ -426,7 +638,7 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
     func launchDidFail(errorMessage: String) {
         guard launchInProgress else { return }
         launchInProgress = false
-        render()
+        show()
 
         let alert = NSAlert()
         alert.alertStyle = .critical
@@ -437,11 +649,20 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        NSApp.terminate(nil)
+        if virtualMachineRunning {
+            closeSettings()
+        } else {
+            NSApp.terminate(nil)
+        }
         return false
     }
 
     private func render() {
+        defer { onAppReleasePromptOpportunity?() }
+        for (button, wasEnabled) in permissionDisabledButtons {
+            button.isEnabled = wasEnabled
+        }
+        permissionDisabledButtons.removeAll()
         let preservedScrollOffset = startMenuScrollView?.contentView.bounds.minY ?? 0
         startMenuScrollView = nil
         content.subviews.forEach { $0.removeFromSuperview() }
@@ -455,16 +676,35 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
             icon.heightAnchor.constraint(equalToConstant: 62),
         ])
 
-        let title = NSTextField(labelWithString: "Try Omarchy")
+        let title = NSTextField(labelWithString: virtualMachineRunning ? "Try Omarchy Settings" : "Try Omarchy")
         title.font = .monospacedSystemFont(ofSize: 27, weight: .bold)
         title.textColor = OmarchyStartMenuTheme.foreground
         title.identifier = NSUserInterfaceItemIdentifier("app-title")
 
-        let subtitle = NSTextField(labelWithString: "OMARCHY  ·  APPLE SILICON")
+        let subtitle = NSTextField(labelWithString: "Omarchy, on macOS")
         subtitle.font = .monospacedSystemFont(ofSize: 10, weight: .semibold)
         subtitle.textColor = OmarchyStartMenuTheme.accent
 
         let titleStack = NSStackView(views: [title, subtitle])
+        appReleaseButton = nil
+        if virtualMachineRunning {
+            let version = NSTextField(labelWithString: appVersionLabel)
+            version.font = .systemFont(ofSize: 11)
+            version.textColor = OmarchyStartMenuTheme.muted
+            version.lineBreakMode = .byTruncatingMiddle
+            version.toolTip = appVersionLabel
+            version.identifier = NSUserInterfaceItemIdentifier("app-version")
+            version.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            let updates = NSButton(title: appReleaseActionTitle(), target: self, action: #selector(showAppUpdates))
+            updates.isBordered = false
+            updates.font = .systemFont(ofSize: 11)
+            updates.contentTintColor = OmarchyStartMenuTheme.accent
+            updates.identifier = NSUserInterfaceItemIdentifier("app-release-check")
+            appReleaseButton = updates
+            let versionRow = NSStackView(views: [version, updates])
+            versionRow.spacing = 10
+            titleStack.addArrangedSubview(versionRow)
+        }
         titleStack.orientation = .vertical
         titleStack.alignment = .leading
         titleStack.spacing = 3
@@ -474,45 +714,19 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
         headingStack.alignment = .centerY
         headingStack.spacing = 14
 
-        let accessibilityGranted = accessibilityStatus()
-        let accessibilityRow = permissionRow(
-            symbolName: "accessibility",
-            title: "Accessibility",
-            detail: "Needed for the native keyboard experience with Super shortcuts.",
-            granted: accessibilityGranted,
-            actionTitle: accessibilityGranted ? nil : "Open Settings",
-            action: #selector(beginAccessibilityRequest)
+        let accessibilityRow = StartMenuPermissionRow(
+            symbolName: "accessibility", title: "Accessibility", target: self
         )
-
-        let microphonePresentation = StartMenuPresentation.microphone(
-            state: microphoneStatus(),
-            requestInFlight: microphoneRequestInFlight
+        let microphoneRow = StartMenuPermissionRow(
+            symbolName: "mic", title: "Microphone access", target: self
         )
-        let microphoneRow = permissionRow(
-            symbolName: "mic",
-            title: "Microphone access",
-            detail: microphonePresentation.detail,
-            granted: microphonePresentation.isGranted,
-            actionTitle: microphonePresentation.actionTitle,
-            action: microphonePresentation.action == .openSettings
-                ? #selector(openMicrophoneSettings)
-                : #selector(beginMicrophoneRequest)
+        let cameraRow = StartMenuPermissionRow(
+            symbolName: "camera", title: "Camera access", target: self
         )
-
-        let cameraPresentation = StartMenuPresentation.camera(
-            state: cameraStatus(),
-            requestInFlight: cameraRequestInFlight
-        )
-        let cameraRow = permissionRow(
-            symbolName: "camera",
-            title: "Camera access",
-            detail: cameraPresentation.detail,
-            granted: cameraPresentation.isGranted,
-            actionTitle: cameraPresentation.actionTitle,
-            action: cameraPresentation.action == .openSettings
-                ? #selector(openCameraSettings)
-                : #selector(beginCameraRequest)
-        )
+        self.accessibilityRow = accessibilityRow
+        self.microphoneRow = microphoneRow
+        self.cameraRow = cameraRow
+        updatePermissionRows()
 
         let sharedFolder = sharedFolderStatus()
         let sharedFolderPresentation = StartMenuPresentation.sharedFolder(state: sharedFolder)
@@ -533,6 +747,29 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
             statusLabels: ("●  On", "○  Off"),
             actions: sharedFolderActions,
             minimumHeight: 100
+        )
+
+        let usbDevice = usbDeviceStatus()
+        let usbPresentation = StartMenuPresentation.usbDevice(state: usbDevice)
+        var usbActions: [(String, Selector)] = [("Choose\u{2026}", #selector(beginUSBDeviceSelection))]
+        if let toggleTitle = usbPresentation.toggleActionTitle {
+            usbActions.append(
+                usbDevice.isEnabled
+                    ? (toggleTitle, #selector(disableUSBDevice))
+                    : (toggleTitle, #selector(enableUSBDevice))
+            )
+        }
+        let usbRow = permissionRow(
+            symbolName: "cable.connector",
+            title: "USB device (experimental)",
+            detail: usbPresentation.detail,
+            compactDetailLines: usbPresentation.compactDetailLines,
+            granted: usbPresentation.isGranted,
+            statusLabels: ("\u{25cf}  On", "\u{25cb}  Off"),
+            actions: usbActions,
+            actionsEnabled: usbPresentation.actionsEnabled,
+            minimumHeight: 100,
+            rowIdentifier: "usb"
         )
 
         let network = networkPreferences()
@@ -627,7 +864,7 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
                 granted: !storageStatus.isDefault && storageStatus.problem == nil,
                 statusLabels: ("\u{25cf}  Custom", "\u{25cb}  Default"),
                 actions: storageActions,
-                actionsEnabled: canResetStorage && !storageStatus.isEnvironmentOverride,
+                actionsEnabled: canResetStorage && !virtualMachineRunning && !storageStatus.isEnvironmentOverride,
                 minimumHeight: storageDetailLines != nil || storageActions.count > 1 ? 90 : 68
             )
         }
@@ -637,7 +874,7 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
         if let storageRow {
             integrationRowViews.append(storageRow)
         }
-        integrationRowViews.append(contentsOf: [resourceRow, networkingRow, portForwardingRow, immersiveRow])
+        integrationRowViews.append(contentsOf: [resourceRow, networkingRow, portForwardingRow, usbRow, immersiveRow, automaticStartSettingRow()])
 
         var permissionRowsAndSeparators: [NSView] = []
         for (index, row) in permissionRowViews.enumerated() {
@@ -691,43 +928,43 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
         let integrationHeading = sectionHeading("INTEGRATIONS")
 
         let reset = OmarchyActionButton(
-            title: resetInProgress ? "Resetting Omarchy…" : "Reset Omarchy",
+            title: resetInProgress ? resetPhase.buttonTitle : "Reset Omarchy",
             style: .danger,
             target: self,
             action: #selector(resetOmarchy)
         )
+        resetActionButton = reset
         reset.identifier = NSUserInterfaceItemIdentifier("reset-button")
         reset.isEnabled = canResetStorage
-            && !launchInProgress
+            && !prelaunchControlsLocked
             && !resetInProgress
-            && !microphoneRequestInFlight
-            && !cameraRequestInFlight
         reset.toolTip = canResetStorage
             ? "Erase this VM and return it to factory settings"
             : "Reset is unavailable for a disposable VM"
         reset.heightAnchor.constraint(equalToConstant: 30).isActive = true
         reset.widthAnchor.constraint(greaterThanOrEqualToConstant: 154).isActive = true
 
-        let resetViews: [NSView] = [reset]
-        let resetSection = NSStackView(views: resetViews)
-        resetSection.orientation = .vertical
-        resetSection.alignment = .centerX
-        resetSection.spacing = 4
+        let manage = OmarchyActionButton(title: "Shut Down", style: .secondary, target: self, action: #selector(shutDownToManage))
+        manage.heightAnchor.constraint(equalToConstant: 36).isActive = true
+        manage.setContentCompressionResistancePriority(.required, for: .horizontal)
+        manage.identifier = NSUserInterfaceItemIdentifier("manage-vm-button")
+        manage.isEnabled = !controlsBusy
+        let resetAction = virtualMachineRunning && canResetStorage ? manage : reset
 
-        let launchButtonTitle = launchInProgress ? "Launching Omarchy…" : "Launch Omarchy"
+        let fixesPending = GuestBootFixCache.needsUpdate(cacheURL: bootFixCacheURL(), expectedIdentity: bootFixIdentity())
+        let launchButtonTitle = virtualMachineRunning ? "Done" : (launchInProgress ? launchPhase.buttonTitle : (fixesPending ? "Update and Launch" : "Launch Omarchy"))
         let launchButton = OmarchyActionButton(
             title: launchButtonTitle,
             style: .primary,
             target: self,
-            action: #selector(launchOmarchy)
+            action: virtualMachineRunning ? #selector(closeSettings) : (fixesPending ? #selector(reviewVMFixes) : #selector(launchOmarchy))
         )
+        launchActionButton = launchButton
         launchButton.keyEquivalent = launchInProgress ? "" : "\r"
-        launchButton.isEnabled = !launchInProgress
-            && !resetInProgress
-            && !microphoneRequestInFlight
-            && !cameraRequestInFlight
+        launchButton.isEnabled = virtualMachineRunning || (!launchInProgress
+            && !resetInProgress)
         launchButton.identifier = NSUserInterfaceItemIdentifier("launch-button")
-        launchButton.setAccessibilityLabel(launchInProgress ? "Launching Omarchy" : "Launch Omarchy")
+        launchButton.setAccessibilityLabel(launchButtonTitle)
         if launchInProgress {
             let spinner = NSProgressIndicator()
             spinner.style = .spinning
@@ -742,18 +979,65 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
         }
         NSLayoutConstraint.activate([
             launchButton.heightAnchor.constraint(equalToConstant: 48),
-            launchButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 500),
         ])
 
-        let stack = NSStackView(views: [
-            headingStack,
-            permissionHeading,
-            permissionCard,
-            integrationHeading,
-            integrationCard,
-            launchButton,
-            resetSection,
+        let resetHeading = sectionHeading("RESET")
+        let resetSymbol = NSImageView()
+        resetSymbol.image = NSImage(systemSymbolName: "arrow.counterclockwise", accessibilityDescription: nil)
+        resetSymbol.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 19, weight: .medium)
+        resetSymbol.contentTintColor = OmarchyStartMenuTheme.accent
+        resetSymbol.identifier = NSUserInterfaceItemIdentifier("reset-symbol")
+        resetSymbol.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            resetSymbol.widthAnchor.constraint(equalToConstant: 26),
+            resetSymbol.heightAnchor.constraint(equalToConstant: 26),
         ])
+        let resetTitle = NSTextField(labelWithString: "Factory reset")
+        resetTitle.font = .monospacedSystemFont(ofSize: 13, weight: .bold)
+        resetTitle.textColor = OmarchyStartMenuTheme.foreground
+        let resetDetail = NSTextField(wrappingLabelWithString: virtualMachineRunning
+            ? "Shut down Omarchy to change the VM location or reset it to factory settings."
+            : "Erase this VM and return it to factory settings.")
+        resetDetail.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+        resetDetail.textColor = OmarchyStartMenuTheme.muted
+        resetDetail.maximumNumberOfLines = 3
+        let resetLabels = NSStackView(views: [resetTitle, resetDetail])
+        resetLabels.orientation = .vertical
+        resetLabels.alignment = .leading
+        resetLabels.spacing = 3
+        resetLabels.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        resetLabels.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        resetDetail.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        resetDetail.trailingAnchor.constraint(lessThanOrEqualTo: resetLabels.trailingAnchor).isActive = true
+        let resetRow = NSStackView(views: [resetSymbol, resetLabels, resetAction])
+        resetRow.orientation = .horizontal
+        resetRow.alignment = .centerY
+        resetRow.spacing = 12
+        resetRow.translatesAutoresizingMaskIntoConstraints = false
+        resetRow.heightAnchor.constraint(greaterThanOrEqualToConstant: 64).isActive = true
+        let resetCard = themedCard(containing: resetRow, identifier: "reset-card")
+
+        let restart = OmarchyActionButton(title: "Restart Omarchy", style: .secondary, target: self, action: #selector(restartOmarchy))
+        restart.heightAnchor.constraint(equalToConstant: 36).isActive = true
+        restart.setContentCompressionResistancePriority(.required, for: .horizontal)
+        restart.identifier = NSUserInterfaceItemIdentifier("restart-vm-button")
+        restart.isEnabled = !controlsBusy
+        let restartCaption = NSTextField(wrappingLabelWithString: shutdownInProgress
+            ? "Waiting for Omarchy to shut down. Finish saving your work inside Omarchy."
+            : "CPU, memory, shared folder, networking, port forwarding, and immersive mode changes apply when Try Omarchy next starts. Restart to apply them now.")
+        restartCaption.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+        restartCaption.textColor = OmarchyStartMenuTheme.muted
+        restartCaption.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        restartCaption.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let runningActions = NSStackView(views: [restartCaption, restart])
+        runningActions.orientation = .horizontal
+        runningActions.alignment = .centerY
+        runningActions.spacing = 16
+        runningActions.identifier = NSUserInterfaceItemIdentifier("running-settings-actions")
+        let settingsSections: [NSView] = [permissionHeading, permissionCard, integrationHeading, integrationCard]
+        let stack = NSStackView(views: virtualMachineRunning
+            ? [headingStack, runningActions] + settingsSections + [resetHeading, resetCard]
+            : [headingStack] + settingsSections + [resetHeading, resetCard])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 18
@@ -761,9 +1045,15 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
         stack.setCustomSpacing(6, after: permissionHeading)
         stack.setCustomSpacing(16, after: permissionCard)
         stack.setCustomSpacing(6, after: integrationHeading)
-        stack.setCustomSpacing(32, after: integrationCard)
-        stack.setCustomSpacing(24, after: launchButton)
+        stack.setCustomSpacing(6, after: resetHeading)
         stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let actions = NSStackView(views: [launchButton])
+        actions.orientation = .vertical
+        actions.alignment = .leading
+        actions.spacing = 12
+        actions.identifier = NSUserInterfaceItemIdentifier("start-menu-actions")
+        actions.translatesAutoresizingMaskIntoConstraints = false
 
         let document = StartMenuDocumentView()
         document.translatesAutoresizingMaskIntoConstraints = false
@@ -779,27 +1069,37 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
         scrollView.identifier = NSUserInterfaceItemIdentifier("start-menu-scroll")
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(scrollView)
+        content.addSubview(actions)
         startMenuScrollView = scrollView
 
         NSLayoutConstraint.activate([
             scrollView.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             scrollView.topAnchor.constraint(equalTo: content.topAnchor),
-            scrollView.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: actions.topAnchor, constant: -12),
+            actions.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 42),
+            actions.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -42),
+            actions.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -20),
             document.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
             document.heightAnchor.constraint(greaterThanOrEqualTo: scrollView.contentView.heightAnchor),
             stack.leadingAnchor.constraint(equalTo: document.leadingAnchor, constant: 42),
             stack.trailingAnchor.constraint(equalTo: document.trailingAnchor, constant: -42),
             stack.topAnchor.constraint(equalTo: document.topAnchor, constant: 26),
-            stack.bottomAnchor.constraint(equalTo: document.bottomAnchor, constant: -32),
+            stack.bottomAnchor.constraint(equalTo: document.bottomAnchor, constant: -24),
+            headingStack.widthAnchor.constraint(equalTo: stack.widthAnchor),
             permissionCard.widthAnchor.constraint(equalTo: stack.widthAnchor),
             integrationCard.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            resetSection.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            launchButton.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            resetCard.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            launchButton.widthAnchor.constraint(equalTo: actions.widthAnchor),
         ])
+
+        if virtualMachineRunning {
+            runningActions.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
 
         content.layoutSubtreeIfNeeded()
         document.layoutSubtreeIfNeeded()
+        preferredContentHeight = ceil(stack.fittingSize.height + actions.fittingSize.height + 82)
         let maximumOffset = max(
             0,
             document.frame.height - scrollView.contentView.bounds.height
@@ -811,6 +1111,10 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
             )
         )
         scrollView.reflectScrolledClipView(scrollView.contentView)
+        if resetInProgress {
+            reset.scrollToVisible(reset.bounds)
+        }
+        updatePermissionRequestControls()
     }
 
     private func sectionHeading(_ text: String) -> NSTextField {
@@ -977,9 +1281,7 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
                 action: action
             )
             button.isEnabled = actionsEnabled
-                && !microphoneRequestInFlight
-                && !cameraRequestInFlight
-                && !launchInProgress
+                && !controlsBusy
                 && !resetInProgress
             let identifier = actions.count == 1
                 ? "permission-action-\(identifier)"
@@ -1076,32 +1378,67 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
     }
 
     private func immersiveSettingRow(isEnabled: Bool) -> NSView {
+        let setting = toggleSettingRow(
+            titleText: "Immersive",
+            detailText: StartMenuPresentation.immersiveDetail(isEnabled: isEnabled),
+            symbolName: "arrow.up.left.and.arrow.down.right",
+            identifier: "immersive",
+            accessibilityLabel: "Immersive mode",
+            isEnabled: isEnabled,
+            action: #selector(changeImmersiveMode(_:))
+        )
+        immersiveCaption = setting.caption
+        return setting.row
+    }
+
+    private func automaticStartSettingRow() -> NSView {
+        let detail = virtualMachineRunning
+            ? "Launch Omarchy with your saved settings. Open settings anytime from Omarchy’s Setup menu."
+            : "Launch Omarchy with your saved settings. Hold Option while opening the app to show the launcher."
+        return toggleSettingRow(
+            titleText: "Skip launcher",
+            detailText: detail,
+            symbolName: "play.circle",
+            identifier: "automatic-start",
+            accessibilityLabel: "Skip launcher",
+            isEnabled: startAutomatically(),
+            action: #selector(changeStartAutomatically(_:))
+        ).row
+    }
+
+    private func toggleSettingRow(
+        titleText: String,
+        detailText: String,
+        symbolName: String,
+        identifier: String,
+        accessibilityLabel: String,
+        isEnabled: Bool,
+        action: Selector
+    ) -> (row: NSView, caption: NSTextField) {
         let symbol = NSImageView()
         symbol.image = NSImage(
-            systemSymbolName: "arrow.up.left.and.arrow.down.right",
+            systemSymbolName: symbolName,
             accessibilityDescription: nil
         )
         symbol.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 19, weight: .medium)
         symbol.contentTintColor = OmarchyStartMenuTheme.accent
-        symbol.identifier = NSUserInterfaceItemIdentifier("immersive-symbol")
+        symbol.identifier = NSUserInterfaceItemIdentifier("\(identifier)-symbol")
         symbol.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
             symbol.widthAnchor.constraint(equalToConstant: 26),
             symbol.heightAnchor.constraint(equalToConstant: 26),
         ])
 
-        let title = NSTextField(labelWithString: "Immersive")
+        let title = NSTextField(labelWithString: titleText)
         title.font = .monospacedSystemFont(ofSize: 13, weight: .bold)
         title.textColor = OmarchyStartMenuTheme.foreground
-        title.identifier = NSUserInterfaceItemIdentifier("immersive-title")
+        title.identifier = NSUserInterfaceItemIdentifier("\(identifier)-title")
 
-        let detailText = StartMenuPresentation.immersiveDetail(isEnabled: isEnabled)
         let detail = NSTextField(wrappingLabelWithString: detailText)
         detail.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
         detail.textColor = OmarchyStartMenuTheme.muted
         detail.maximumNumberOfLines = 2
-        detail.identifier = NSUserInterfaceItemIdentifier("immersive-caption")
-        immersiveCaption = detail
+        detail.identifier = NSUserInterfaceItemIdentifier("\(identifier)-caption")
 
         let labels = NSStackView(views: [title, detail])
         labels.orientation = .vertical
@@ -1112,17 +1449,17 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
         let toggle = OmarchyToggleButton(
             isOn: isEnabled,
             target: self,
-            action: #selector(changeImmersiveMode(_:))
+            action: action
         )
-        toggle.isEnabled = !microphoneRequestInFlight && !launchInProgress && !resetInProgress
-        toggle.identifier = NSUserInterfaceItemIdentifier("immersive-toggle")
-        toggle.setAccessibilityLabel("Immersive mode")
+        toggle.isEnabled = !controlsBusy && !resetInProgress
+        toggle.identifier = NSUserInterfaceItemIdentifier("\(identifier)-toggle")
+        toggle.setAccessibilityLabel(accessibilityLabel)
         toggle.setAccessibilityTitleUIElement(title)
         toggle.setAccessibilityHelp(detailText)
         toggle.translatesAutoresizingMaskIntoConstraints = false
 
         let row = NSView()
-        row.identifier = NSUserInterfaceItemIdentifier("immersive-row")
+        row.identifier = NSUserInterfaceItemIdentifier("\(identifier)-row")
         row.translatesAutoresizingMaskIntoConstraints = false
         row.addSubview(symbol)
         row.addSubview(labels)
@@ -1139,33 +1476,28 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
         ])
         labels.setContentHuggingPriority(.defaultLow, for: .horizontal)
         labels.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        return row
+        return (row, detail)
     }
 
     @objc private func beginAccessibilityRequest() {
-        permissionWindowRestorer.cancel()
         requestAccessibility()
-        render()
+        updatePermissionRows()
     }
 
     @objc private func beginMicrophoneRequest() {
         guard microphoneStatus() == .notDetermined, !microphoneRequestInFlight else { return }
-        permissionWindowRestorer.cancel()
-        let windowFrame = window.frame
         microphoneRequestInFlight = true
-        render()
+        updatePermissionRows()
         requestMicrophone { [weak self] _ in
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.microphoneRequestInFlight = false
-                self.render()
-                self.permissionWindowRestorer.requestDidFinish(preserving: windowFrame)
+                self.updatePermissionRows()
             }
         }
     }
 
     @objc private func openMicrophoneSettings() {
-        permissionWindowRestorer.cancel()
         guard let url = URL(
             string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
         ) else { return }
@@ -1174,22 +1506,18 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
 
     @objc private func beginCameraRequest() {
         guard cameraStatus() == .notDetermined, !cameraRequestInFlight else { return }
-        permissionWindowRestorer.cancel()
-        let windowFrame = window.frame
         cameraRequestInFlight = true
-        render()
+        updatePermissionRows()
         requestCamera { [weak self] _ in
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.cameraRequestInFlight = false
-                self.render()
-                self.permissionWindowRestorer.requestDidFinish(preserving: windowFrame)
+                self.updatePermissionRows()
             }
         }
     }
 
     @objc private func openCameraSettings() {
-        permissionWindowRestorer.cancel()
         guard let url = URL(
             string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera"
         ) else { return }
@@ -1197,7 +1525,6 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
     }
 
     @objc private func openStorageLocation() {
-        permissionWindowRestorer.cancel()
         guard let storageLocationURL = storageLocationURL() else { return }
         do {
             if !FileManager.default.fileExists(atPath: storageLocationURL.path) {
@@ -1246,8 +1573,7 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
     }
 
     @objc private func beginStorageLocationSelection() {
-        guard canResetStorage, !launchInProgress, !resetInProgress else { return }
-        permissionWindowRestorer.cancel()
+        guard canResetStorage, !prelaunchControlsLocked, !resetInProgress else { return }
         let panel = NSOpenPanel()
         panel.title = "Choose where to keep the Omarchy VM"
         panel.message = "Omarchy puts its VM files straight into the folder you choose \u{2014} it does not create a folder inside it. Pick an empty folder, or one Omarchy already uses. The drive must be APFS."
@@ -1302,17 +1628,16 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
     }
 
     @objc private func useDefaultStorageLocationAction() {
-        guard canResetStorage, !launchInProgress, !resetInProgress else { return }
+        guard canResetStorage, !prelaunchControlsLocked, !resetInProgress else { return }
         useDefaultStorageLocation()
         render()
     }
 
     @objc private func beginSharedFolderSelection() {
-        guard !launchInProgress,
+        guard !controlsBusy,
               !resetInProgress,
               !microphoneRequestInFlight,
               !cameraRequestInFlight else { return }
-        permissionWindowRestorer.cancel()
         let panel = NSOpenPanel()
         panel.title = "Choose a folder to share with Omarchy"
         panel.message = "Omarchy will be able to read and change everything inside this folder, linked as ~/<folder name>."
@@ -1340,20 +1665,54 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
     }
 
     @objc private func enableSharedFolder() {
+        guard !controlsBusy, !resetInProgress else { return }
         setSharedFolderEnabled(true)
         render()
     }
 
     @objc private func disableSharedFolder() {
+        guard !controlsBusy, !resetInProgress else { return }
         setSharedFolderEnabled(false)
         render()
     }
 
+    @objc private func beginUSBDeviceSelection() {
+        guard !controlsBusy, !resetInProgress,
+              !microphoneRequestInFlight, !cameraRequestInFlight,
+              usbDeviceEditor == nil, window.attachedSheet == nil else { return }
+        let state = usbDeviceStatus()
+        let editor = USBDeviceEditor(
+            preference: USBDevicePreference(device: state.device, isEnabled: state.isEnabled),
+            connected: connectedUSBDevices(),
+            save: { [weak self] preference in self?.saveUSBDevice(preference) },
+            didClose: { [weak self] in
+                self?.usbDeviceEditor = nil
+                self?.render()
+            }
+        )
+        usbDeviceEditor = editor
+        editor.beginSheet(for: window)
+    }
+
+    @objc private func enableUSBDevice() {
+        setUSBDeviceEnabled(true)
+    }
+
+    @objc private func disableUSBDevice() {
+        setUSBDeviceEnabled(false)
+    }
+
+    private func setUSBDeviceEnabled(_ isEnabled: Bool) {
+        let state = usbDeviceStatus()
+        guard let device = state.device else { return }
+        saveUSBDevice(USBDevicePreference(device: device, isEnabled: isEnabled))
+        render()
+    }
+
     @objc private func beginNetworkConfiguration() {
-        guard !launchInProgress, !resetInProgress, networkEditor == nil else { return }
-        permissionWindowRestorer.cancel()
+        guard !controlsBusy, !resetInProgress, networkEditor == nil else { return }
         let editor = NetworkEditor(preferences: networkPreferences(), interfaces: VMBridgeInterfaces.available(),
-            save: saveNetworkPreferences, didClose: { [weak self] in
+            identity: networkIdentity, save: saveNetworkPreferences, didClose: { [weak self] in
                 self?.networkEditor = nil
                 self?.render()
             })
@@ -1362,8 +1721,7 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
     }
 
     @objc private func beginPortForwardingConfiguration() {
-        guard !launchInProgress, !resetInProgress, portForwardingEditor == nil else { return }
-        permissionWindowRestorer.cancel()
+        guard !controlsBusy, !resetInProgress, portForwardingEditor == nil else { return }
         let editor = PortForwardingEditor(
             mappings: portForwardingStatus(),
             save: { [weak self] mappings in
@@ -1383,13 +1741,13 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
     }
 
     @objc private func beginResourceConfiguration() {
-        guard !launchInProgress, !resetInProgress,
+        guard !controlsBusy, !resetInProgress,
               !microphoneRequestInFlight, !cameraRequestInFlight,
               resourceEditor == nil, window.attachedSheet == nil else { return }
-        permissionWindowRestorer.cancel()
         let editor = VMResourceEditor(
             resources: resources(),
             limits: resourceLimits,
+            minimumDiskGiB: minimumDiskGiB(),
             save: { [weak self] resources in self?.saveResources(resources) },
             didClose: { [weak self] in
                 self?.resourceEditor = nil
@@ -1401,7 +1759,7 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
     }
 
     @objc private func changeImmersiveMode(_ sender: NSButton) {
-        guard !launchInProgress, !resetInProgress else { return }
+        guard !controlsBusy, !resetInProgress else { return }
         let isEnabled = sender.state == .on
         setImmersiveMode(isEnabled)
         let detailText = StartMenuPresentation.immersiveDetail(isEnabled: isEnabled)
@@ -1420,12 +1778,11 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
 
     private func confirmReset() {
         guard canResetStorage,
-              !launchInProgress,
+              !prelaunchControlsLocked,
               !resetInProgress,
               !microphoneRequestInFlight,
               !cameraRequestInFlight,
               resetConfirmationPrompt == nil else { return }
-        permissionWindowRestorer.cancel()
         let estimate = storageSpaceEstimate()
         var detail = "This permanently erases everything in this Omarchy virtual machine, including apps, files, accounts, and settings. This cannot be undone or recovered."
         // With a chosen data folder there can be more than one workspace on the
@@ -1437,6 +1794,7 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
             // controller, which owns the preference and can explain and offer
             // to switch, rather than asking the user to confirm erasing a
             // workspace we would only be guessing the identity of.
+            resetPhase = .checking
             resetInProgress = true
             render()
             resetStorage()
@@ -1458,20 +1816,68 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
             resetConfirmationPrompt = nil
             guard confirmed else { return }
             pendingResetSpaceEstimate = estimate
+            resetPhase = .checking
             resetInProgress = true
             render()
             resetStorage()
         }
     }
 
-    @objc private func launchOmarchy() {
-        guard !launchInProgress,
+    @objc private func changeStartAutomatically(_ sender: NSButton) {
+        guard !controlsBusy, !resetInProgress else { return }
+        if sender.state == .on {
+            // Keep the preference and toggle off until the user confirms.
+            sender.state = .off
+            let alert = NSAlert()
+            alert.alertStyle = .informational
+            alert.messageText = "Skip the launcher"
+            alert.informativeText = """
+                If this setting is on, Omarchy will start automatically with your current settings whenever you open Try Omarchy.
+
+                To see the launcher again, hold Option while opening the app, or inside Omarchy, open the Omarchy menu and choose Setup → Try Omarchy Settings.
+                """
+            alert.addButton(withTitle: "OK")
+            alert.addButton(withTitle: "Cancel")
+            automaticStartupConfirmationInProgress = true
+            let confirmed = confirmAutomaticStartup(alert) == .alertFirstButtonReturn
+            automaticStartupConfirmationInProgress = false
+            guard confirmed, !controlsBusy, !resetInProgress else { return }
+            saveAutomaticStartup(true, sender: sender)
+        } else {
+            saveAutomaticStartup(false, sender: sender)
+        }
+        (sender as? OmarchyToggleButton)?.refreshAppearance()
+    }
+
+    private func saveAutomaticStartup(_ enabled: Bool, sender: NSButton) {
+        if let error = setStartAutomatically(enabled) {
+            sender.state = startAutomatically() ? .on : .off
+            let alert = NSAlert()
+            alert.messageText = "Skip launcher couldn’t be saved"
+            alert.informativeText = error
+            presentStartupSaveError(alert, window)
+        } else {
+            sender.state = enabled ? .on : .off
+        }
+    }
+
+    @objc func launchOmarchy() {
+        beginLaunch(action: launch)
+    }
+
+    @objc private func reviewVMFixes() {
+        beginLaunch(action: retryBootFixes)
+    }
+
+    private func beginLaunch(action: () -> Void) {
+        guard !prelaunchControlsLocked,
               !resetInProgress,
               !microphoneRequestInFlight,
               !cameraRequestInFlight else { return }
+        launchPhase = .checking
         launchInProgress = true
         render()
-        launch()
+        action()
     }
 }
 

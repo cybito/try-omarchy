@@ -60,7 +60,7 @@ info_plist="$app/Contents/Info.plist"
 bundle_identifier=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$info_plist" 2>/dev/null) || {
   fail "built app has no bundle identifier"
 }
-[[ $bundle_identifier == dev.tryomarchy.native ]] || {
+[[ $bundle_identifier == dev.tryomarchy.native.development ]] || {
   fail "built app has an unexpected bundle identifier: $bundle_identifier"
 }
 bundle_executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$info_plist" 2>/dev/null) || {
@@ -78,10 +78,18 @@ camera_usage=$(/usr/libexec/PlistBuddy -c 'Print :NSCameraUsageDescription' "$in
 }
 [[ -n $camera_usage ]] || fail "built app has an empty camera usage description"
 
+# `open` starts the app from the launchd session, not this shell, so the
+# experimental USB opt-in only reaches the VM when it is forwarded explicitly.
+usb_environment=()
+if [[ -n ${OMARCHY_QEMU_GPU_USB_HOST:-} ]]; then
+  usb_environment=(--env "OMARCHY_QEMU_GPU_USB_HOST=$OMARCHY_QEMU_GPU_USB_HOST")
+fi
+
 exec /usr/bin/open \
   -n \
   -W \
-  --env OMARCHY_QEMU_GPU_DEVELOPMENT_MULTI_DISK=1 \
+  --env OMARCHY_QEMU_GPU_DEVELOPMENT_MULTI_DISK=0 \
+  ${usb_environment[@]+"${usb_environment[@]}"} \
   --stdin /dev/null \
   --stdout /dev/null \
   --stderr /dev/null \
