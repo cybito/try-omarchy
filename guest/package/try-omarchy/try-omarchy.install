@@ -1,0 +1,70 @@
+# Units are enabled through presets on first install; later upgrades keep the
+# administrator's choices. systemd and udev reload through their own pacman hooks.
+_units='try-omarchy-host-config.service try-omarchy-grow-root.service try-omarchy-ssh-access.service try-omarchy-guest-status.service
+try-omarchy-package-install.service omarchy-native-battery-bridge.service omarchy-native-mac-share.service
+try-omarchy-locale.service try-omarchy-timezone.service try-omarchy-clock-recovery.timer'
+_user_units='omarchy-native-audio-bridge.service omarchy-native-camera-bridge.service
+omarchy-native-clipboard-bridge.service omarchy-native-mac-share-link.service try-omarchy-session.service'
+
+# logind rereads its drop-ins (the power-key policy) on SIGHUP.
+_reload_logind() {
+  systemctl kill -s HUP systemd-logind.service >/dev/null 2>&1 || true
+}
+
+# The guest's clock follows NTP between Mac sleeps (guest-clock-recover
+# restarts it after one); stock Omarchy doesn't enable it.
+_enable_ntp() {
+  systemctl enable --now systemd-timesyncd.service >/dev/null 2>&1 || true
+}
+
+# The kernel command line is built into Limine's boot image, so a drop-in
+# added by an upgrade (arm64.nosme) waits for the next rebuild. Rebuild once
+# where the running kernel still shows SME; it takes effect at the next boot.
+_hide_sme() {
+  local cpuinfo=${1:-/proc/cpuinfo} cmdline=${2:-/proc/cmdline} limine=${3:-/boot/limine.conf}
+  grep -qw sme "$cpuinfo" 2>/dev/null || return 0
+  ! grep -qw arm64.nosme "$cmdline" 2>/dev/null || return 0
+  # Containers (the package tests) have no Limine boot partition.
+  [ -f "$limine" ] && command -v limine-update >/dev/null 2>&1 || return 0
+  limine-update >/dev/null 2>&1 || true
+}
+
+post_install() {
+  systemctl preset $_units >/dev/null 2>&1 || true
+  _enable_ntp
+  systemctl --global preset $_user_units >/dev/null 2>&1 || true
+  _reload_logind
+}
+
+# Removal undoes the install's enablement, so no unit link outlives its unit.
+pre_remove() {
+  systemctl disable $_units >/dev/null 2>&1 || true
+  systemctl --global disable $_user_units >/dev/null 2>&1 || true
+}
+
+post_upgrade() {
+  # Earlier packages started these in every user manager, including SSH and
+  # owner provisioning, before logind granted the desktop's device access.
+  # Rebuild enabled global links for their new graphical-session target;
+  # leave disabled or masked units alone.
+  for unit in omarchy-native-audio-bridge.service omarchy-native-camera-bridge.service; do
+    if [ "$(systemctl --global is-enabled "$unit" 2>/dev/null)" = enabled ]; then
+      systemctl --global reenable "$unit" >/dev/null 2>&1 || true
+    fi
+  done
+  # A unit added in a later release is enabled here, by name, the first time
+  # an upgrade brings it (systemctl preset <unit>).
+  if [ "$(vercmp "$2" 0.1.0-13)" -lt 0 ]; then
+    _enable_ntp
+  fi
+  if [ "$(vercmp "$2" 0.1.0-27)" -lt 0 ]; then
+    _hide_sme
+  fi
+  # The app upgrades the package at boot, after the old host-config ran, and
+  # before the desktop starts: run the new one so this boot already has the
+  # camera cutouts it writes.
+  if [ "$(vercmp "$2" 0.1.0-28)" -lt 0 ]; then
+    systemctl try-restart try-omarchy-host-config.service >/dev/null 2>&1 || true
+  fi
+  _reload_logind
+}

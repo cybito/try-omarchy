@@ -64,6 +64,11 @@ final class VMApplicationController: NSObject, NSApplicationDelegate {
     private let volumeRootDetector: VolumeRootDetecting
     private let deviceProvider: HostAudioDeviceProviding
     private let bundledMetrics: BundledGuestMetrics?
+    private let factoryManifest: FactoryDownloadManifest?
+    private let bundlesFactoryImage: Bool
+    private var factoryDownloader: FactoryImageDownloader?
+    /// Where this launch's downloaded image lives, cleaned once the VM runs.
+    private var launchedFactoryDirectories: [URL] = []
     private var startMenuWindow: StartMenuWindow?
     private var settingsBridge: NativeSettingsBridge?
     private var controlSocketPath: String?
@@ -86,11 +91,6 @@ final class VMApplicationController: NSObject, NSApplicationDelegate {
     private var childRunning = false
     private var applicationTerminationPending = false
     private var virtualMachineReachedStart = false
-    private var activeLaunchAllowedBootRecovery = false
-    private var activeBootFixConsent: String?
-    private var activeBootFixCacheURL: URL?
-    private var bootFixResultReceived = false
-    private var bootFixResultTimer: Timer?
     private var pendingHostSleepControlFailure: String?
 
     /// True while a modal alert this controller opened itself (rather than
@@ -120,6 +120,8 @@ final class VMApplicationController: NSObject, NSApplicationDelegate {
         volumeRootDetector: VolumeRootDetecting = FileManagerVolumeRootDetector(),
         deviceProvider: HostAudioDeviceProviding = CoreAudioHostAudioDeviceProvider(),
         bundledMetrics: BundledGuestMetrics? = QEMUGPUStorageSpaceEstimate.bundledMetrics(),
+        factoryManifest: FactoryDownloadManifest? = FactoryDownloadManifest.bundled(),
+        bundlesFactoryImage: Bool = QEMUGPUStorageSpaceEstimate.bundlesFactoryImage(),
         appReleaseChecker: AppReleaseChecker? = nil
     ) {
         self.launcherURL = launcherURL
@@ -140,6 +142,8 @@ final class VMApplicationController: NSObject, NSApplicationDelegate {
         self.volumeRootDetector = volumeRootDetector
         self.deviceProvider = deviceProvider
         self.bundledMetrics = bundledMetrics
+        self.factoryManifest = factoryManifest
+        self.bundlesFactoryImage = bundlesFactoryImage
         self.appReleaseChecker = appReleaseChecker ?? AppReleaseChecker()
     }
 
@@ -155,15 +159,10 @@ final class VMApplicationController: NSObject, NSApplicationDelegate {
         let startAutomatically = StartupPolicy.shouldStartAutomatically(
             isEnabled: startupPreferenceStore.load(storageRoot: startupRoot),
             hasExistingVM: startupRoot.map {
-                QEMUGPUStorageSpaceEstimate.hasRecordedPersistentDisk(
-                    stateRoot: $0.path, bundleIdentity: bundledMetrics?.identity
-                )
+                QEMUGPUStorageSpaceEstimate.hasRecordedPersistentDisk(stateRoot: $0.path)
             } ?? false,
             optionKeyHeld: NSEvent.modifierFlags.contains(.option),
-            initialArguments: initialArguments,
-            requiresVMFixReview: GuestBootFixCache.needsReview(
-                cacheURL: bootFixCacheURL(), expectedIdentity: GuestBootFixCache.bundledIdentity
-            )
+            initialArguments: initialArguments
         )
         prepareStartMenu(startAutomatically: startAutomatically)
         appReleaseChecker.checkAutomaticallyIfDue()
@@ -247,14 +246,15 @@ final class VMApplicationController: NSObject, NSApplicationDelegate {
             canResetStorage: canResetStorage,
             storageLocation: { [weak self] in
                 guard canResetStorage, let self else { return nil }
-                return QEMUGPUStorageSpaceEstimate.dataDirectoryDisplayPath(
+                guard let root = QEMUGPUStorageSpaceEstimate.storageRootURL(
                     environment: self.baseEnvironment,
                     preference: self.storageLocationStore.load()
-                )
+                ) else { return nil }
+                return StorageLocationPolicy.displayPath(root.path, homeDirectory: Self.homeDirectory)
             },
             storageLocationURL: { [weak self] in
                 guard canResetStorage, let self else { return nil }
-                return QEMUGPUStorageSpaceEstimate.dataDirectoryURL(
+                return QEMUGPUStorageSpaceEstimate.storageRootURL(
                     environment: self.baseEnvironment,
                     preference: self.storageLocationStore.load()
                 )
@@ -263,7 +263,6 @@ final class VMApplicationController: NSObject, NSApplicationDelegate {
                 guard let self else { return nil }
                 return QEMUGPUStorageSpaceEstimate.formattedReclaimableSpace(
                     environment: self.baseEnvironment,
-                    bundleIdentity: self.bundledMetrics?.identity,
                     preference: self.storageLocationStore.load()
                 )
             },
@@ -281,6 +280,12 @@ final class VMApplicationController: NSObject, NSApplicationDelegate {
             },
             resetStorage: { [weak self] in
                 self?.resetVirtualMachine()
+            },
+            deleteStorageLocation: { [weak self] source, identity, completion in
+                self?.deleteStorageLocation(source, identity: identity, completion: completion)
+            },
+            moveStorageLocation: { [weak self] source, path, progress, completion in
+                self?.moveStorageLocation(from: source, to: path, progress: progress, completion: completion)
             },
             sharedFolderStatus: { [weak self] in
                 self?.sharedFolderMenuState() ?? SharedFolderMenuState.disabled
@@ -327,9 +332,20 @@ final class VMApplicationController: NSObject, NSApplicationDelegate {
                 self?.fullscreenPreferenceStore.load().isImmersive ?? true
             },
             setImmersiveMode: { [weak self] isImmersive in
-                self?.fullscreenPreferenceStore.save(
-                    FullscreenPreferences(isImmersive: isImmersive)
-                )
+                guard let store = self?.fullscreenPreferenceStore else { return }
+                var preferences = store.load()
+                preferences.isImmersive = isImmersive
+                store.save(preferences)
+            },
+            notchAvailable: { HostDisplayCutouts.macHasNotch() },
+            usesNotch: { [weak self] in
+                self?.fullscreenPreferenceStore.load().usesNotch ?? true
+            },
+            setUsesNotch: { [weak self] usesNotch in
+                guard let store = self?.fullscreenPreferenceStore else { return }
+                var preferences = store.load()
+                preferences.usesNotch = usesNotch
+                store.save(preferences)
             },
             startAutomatically: { [weak self] in
                 guard let self else { return false }
@@ -351,18 +367,13 @@ final class VMApplicationController: NSObject, NSApplicationDelegate {
                 self?.appReleaseChecker.menuTitle ?? "Check for Updates…"
             },
             checkForAppUpdates: { [weak self] in self?.checkForAppUpdates(nil) },
-            bootFixCacheURL: { [weak self] in self?.bootFixCacheURL() },
-            retryBootFixes: { [weak self] in
-                self?.startVirtualMachine(reviewBootFixes: true)
-            },
             launch: { [weak self] in
                 self?.startVirtualMachine()
             }
         )
         startMenuWindow = startMenu
         startMenu.onAppReleasePromptOpportunity = { [weak self] in self?.scheduleAppReleasePrompt() }
-        // Automatic startup uses the same launch path as the button, including
-        // any required VM fix or boot recovery consent before QEMU starts.
+        // Automatic startup uses the same launch path as the button.
         if startAutomatically {
             startMenu.launchOmarchy()
         } else {
@@ -380,16 +391,7 @@ final class VMApplicationController: NSObject, NSApplicationDelegate {
         )
     }
 
-    private func bootFixCacheURL() -> URL? {
-        guard !isDisposable else { return nil }
-        guard let root = QEMUGPUStorageSpaceEstimate.storageRootURL(
-            environment: baseEnvironment, preference: storageLocationStore.load()),
-              let disk = QEMUGPUStorageSpaceEstimate.recordedPersistentDiskURL(
-                stateRoot: root.path, bundleIdentity: bundledMetrics?.identity) else { return nil }
-        return GuestBootFixCache.url(storageRoot: root, diskURL: disk)
-    }
-
-    private func startVirtualMachine(allowBootRecovery: Bool = false, reviewBootFixes: Bool = false) {
+    private func startVirtualMachine() {
         cancelHostWakeRetry()
         virtualMachineReachedStart = false
         pendingHostSleepControlFailure = nil
@@ -417,46 +419,6 @@ final class VMApplicationController: NSObject, NSApplicationDelegate {
                 startMenuWindow?.launchDidAbort()
                 return
             }
-            let fixesURL = bootFixCacheURL()
-            var fixesConsent: String?
-            if GuestBootFixCache.needsReview(cacheURL: fixesURL, expectedIdentity: GuestBootFixCache.bundledIdentity,
-                                             manuallyRequested: reviewBootFixes) {
-                do { try GuestBootFixCache.recordReview(cacheURL: fixesURL, identity: GuestBootFixCache.bundledIdentity) }
-                catch { fputs("[boot-fixes] Could not retain review: \(error.localizedDescription)\n", stderr) }
-                switch startMenuWindow?.confirmBootFixes() ?? .cancel {
-                case .cancel:
-                    startMenuWindow?.launchDidAbort()
-                    return
-                case .skip: break
-                case .update:
-                    fixesConsent = GuestBootFixCache.consent(cacheURL: fixesURL, identity: GuestBootFixCache.bundledIdentity)
-                }
-            }
-            var approvedBootRecovery = allowBootRecovery
-            if !approvedBootRecovery {
-                let preflight: BootRecoveryLaunchPreflight
-                if initialArguments.first == QEMUGPUStorageOption.ephemeral.rawValue {
-                    preflight = .notRequired
-                } else {
-                    preflight = QEMUGPUStorageSpaceEstimate.bootRecoveryPreflight(
-                        environment: baseEnvironment,
-                        bundleIdentity: bundledMetrics?.identity,
-                        preference: storageLocationStore.load()
-                    )
-                }
-                switch BootRecoveryLaunchGate.decide(
-                    preflight: preflight,
-                    confirm: { [weak self] in
-                        self?.startMenuWindow?.confirmBootRecovery() ?? false
-                    }
-                ) {
-                case .cancel:
-                    startMenuWindow?.launchDidAbort()
-                    return
-                case .launch(let allowBootRecovery):
-                    approvedBootRecovery = allowBootRecovery
-                }
-            }
             let cameraDecision = CameraPreflight.decision()
             if let warning = cameraDecision.warning {
                 fputs("[camera] \(warning)\n", stderr)
@@ -464,11 +426,8 @@ final class VMApplicationController: NSObject, NSApplicationDelegate {
             guard cameraDecision.allowsLaunch else {
                 throw HelperError.io("camera policy unexpectedly prevented launch")
             }
-            try launch(
-                arguments: launchArguments(),
-                allowBootRecovery: approvedBootRecovery,
-                bootFixConsent: fixesConsent
-            )
+            if try beginFactoryDownloadIfNeeded() { return }
+            try launch(arguments: launchArguments())
         } catch {
             failLaunch(error)
         }
@@ -551,6 +510,9 @@ final class VMApplicationController: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if workspaceTransferProcess != nil { return .terminateCancel }
+        // What was downloaded stays for the next launch to resume.
+        factoryDownloader?.cancel()
         guard childRunning else { return .terminateNow }
         guard !applicationTerminationPending else { return .terminateLater }
 
@@ -562,6 +524,7 @@ final class VMApplicationController: NSObject, NSApplicationDelegate {
     }
 
     func handleTerminationSignal(_ signal: Int32) {
+        if workspaceTransferProcess?.isRunning == true { workspaceTransferProcess?.terminate() }
         guard !applicationTerminationPending else { return }
         cancelHostWakeRetry()
         lifecycle.requestTermination(signal: signal)
@@ -573,7 +536,7 @@ final class VMApplicationController: NSObject, NSApplicationDelegate {
     }
 
     private struct ChildLaunchContext {
-        let environment: [String: String]
+        var environment: [String: String]
         let stateRoot: String?
         let portForwardMappings: [PortForwardMapping]
         /// Set when a chosen data folder could not be validated. Starting the
@@ -589,8 +552,7 @@ final class VMApplicationController: NSObject, NSApplicationDelegate {
               let resources = Bundle.main.resourceURL else {
             throw HelperError.io("The VM data folder is unavailable.")
         }
-        return try VMNetworkIdentityAccess.operation(arguments, root: root, resources: resources,
-            environment: context.environment, bundleIdentity: bundledMetrics?.identity)
+        return try VMNetworkIdentityAccess.operation(arguments, root: root, resources: resources)
     }
 
     private func resolvedNetworkPreferences() -> VMNetworkPreferences {
@@ -607,7 +569,7 @@ final class VMApplicationController: NSObject, NSApplicationDelegate {
         let root = disposableWorkspace.directory ?? QEMUGPUStorageSpaceEstimate.storageRootURL(
             environment: baseEnvironment, preference: storageLocationStore.load()
         )
-        let disk = root?.appendingPathComponent("disks/current/rootfs.ext4")
+        let disk = root?.appendingPathComponent("shell/disk.img")
         let attributes = disk.flatMap { try? FileManager.default.attributesOfItem(atPath: $0.path) }
         let bytes = (attributes?[.type] as? FileAttributeType) == .typeRegular
             ? (attributes?[.size] as? NSNumber)?.int64Value : nil
@@ -662,13 +624,17 @@ final class VMApplicationController: NSObject, NSApplicationDelegate {
             preferences: resolvedResources(),
             limits: resourceLimits
         )
-        let language = LanguageLaunchConfiguration.make(
-            baseEnvironment: resources.environment,
-            supportsSelection: supportsLanguageSelection()
-        )
+        let language = LanguageLaunchConfiguration.make(baseEnvironment: resources.environment)
         var storageEnvironment = language.environment
         if let directory = disposableWorkspace.directory {
             storageEnvironment[StorageLocationPolicy.environmentKey] = directory.path
+            // A disposable session clones the main storage folder's factory
+            // copy instead of decompressing its own.
+            if let root = QEMUGPUStorageSpaceEstimate.storageRootURL(
+                environment: baseEnvironment, preference: storageLocationStore.load()) {
+                storageEnvironment[QEMUGPURuntimeEnvironment.factoryCacheKey] =
+                    root.appendingPathComponent("shell-factory", isDirectory: true).path
+            }
         }
         let storage = StorageLocationLaunchConfiguration.make(
             baseEnvironment: storageEnvironment,
@@ -685,8 +651,72 @@ final class VMApplicationController: NSObject, NSApplicationDelegate {
         )
     }
 
-    private func launch(arguments: [String], allowBootRecovery: Bool = false, bootFixConsent: String? = nil) throws {
+    /// The factory a new VM disk needs, for this launch's storage folder.
+    private func factoryImagePreparation(_ context: ChildLaunchContext) -> FactoryImagePreparation {
+        guard context.storageUnavailableReason == nil, let stateRoot = context.stateRoot else {
+            return .ready(image: nil)
+        }
+        return FactoryImagePreparation.plan(
+            manifest: factoryManifest,
+            bundlesImage: bundlesFactoryImage,
+            stateRoot: URL(fileURLWithPath: stateRoot, isDirectory: true),
+            sharedFactory: context.environment[QEMUGPURuntimeEnvironment.factoryCacheKey]
+                .map { URL(fileURLWithPath: $0, isDirectory: true) }
+        )
+    }
+
+    /// Downloads the factory image before a launch that creates a VM, then
+    /// launches. Returns false when the launch can go ahead now.
+    private func beginFactoryDownloadIfNeeded() throws -> Bool {
+        guard factoryDownloader == nil, let manifest = factoryManifest else { return false }
         let context = childLaunchContext()
+        guard case .download(var directory) = factoryImagePreparation(context) else { return false }
+        let stateRoot = URL(fileURLWithPath: context.stateRoot!, isDirectory: true)
+        let localFactory = stateRoot.appendingPathComponent(VMWorkspaceTransfer.factoryCacheName, isDirectory: true)
+        do {
+            // A disposable VM shares the storage folder's copy. A chosen folder
+            // that is missing is never recreated, so the disposable workspace
+            // keeps its own download instead.
+            let mayCreateRoot = directory == localFactory || storageLocationStore.load().isDefault
+                || !(baseEnvironment[StorageLocationPolicy.environmentKey] ?? "").isEmpty
+            try FactoryImageStore.prepareDirectory(directory, mayCreateRoot: mayCreateRoot)
+        } catch where directory != localFactory {
+            directory = localFactory
+            try FactoryImageStore.prepareDirectory(directory, mayCreateRoot: true)
+        }
+        FactoryImageStore.removeObsoleteDownloads(in: directory, identity: manifest.identity)
+        // The launcher then decompresses about half the disk beside it.
+        let reserve = (bundledMetrics?.sourceDiskBytes ?? 0) + StorageSpaceRequirement.headroomBytes
+        let downloader = FactoryImageDownloader(manifest: manifest, directory: directory, reserveBytes: reserve)
+        factoryDownloader = downloader
+        fputs("[download] Preparing the Omarchy image in \(directory.path)\n", stderr)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = Result {
+                try downloader.run { progress in
+                    DispatchQueue.main.async { self?.startMenuWindow?.launchDidDownload(progress) }
+                }
+            }
+            DispatchQueue.main.async { self?.factoryDownloadDidFinish(downloader, result: result) }
+        }
+        return true
+    }
+
+    private func factoryDownloadDidFinish(_ downloader: FactoryImageDownloader, result: Result<URL, Error>) {
+        guard factoryDownloader === downloader else { return }
+        factoryDownloader = nil
+        switch result {
+        case .success(let image):
+            startMenuWindow?.launchDidFinishDownload()
+            do { try launch(arguments: launchArguments(), downloadedFactoryImage: image) } catch { failLaunch(error) }
+        case .failure(FactoryDownloadError.cancelled):
+            startMenuWindow?.launchDidAbort()
+        case .failure(let error):
+            failLaunch(error)
+        }
+    }
+
+    private func launch(arguments: [String], downloadedFactoryImage: URL? = nil) throws {
+        var context = childLaunchContext()
         // The UI gate above normally resolves this first; failing closed here
         // too keeps a silent fallback impossible for any future caller.
         if let reason = context.storageUnavailableReason {
@@ -697,38 +727,35 @@ final class VMApplicationController: NSObject, NSApplicationDelegate {
             try NetworkService.verifyConnection()
         }
         try PortForwardAvailability.validate(context.portForwardMappings)
-        activeStateRoot = context.stateRoot
-        var environment = context.environment
-        if allowBootRecovery {
-            environment = QEMUGPURuntimeEnvironment.withBootRecoveryConsent(environment)
+        launchedFactoryDirectories = context.stateRoot.map {
+            [URL(fileURLWithPath: $0, isDirectory: true)
+                .appendingPathComponent(VMWorkspaceTransfer.factoryCacheName, isDirectory: true)]
+        } ?? []
+        var factoryImage = downloadedFactoryImage
+        if factoryImage == nil, case .ready(let image?) = factoryImagePreparation(context) {
+            factoryImage = image
         }
-        if let bootFixConsent { environment[QEMUGPURuntimeEnvironment.guestFixesConsentKey] = bootFixConsent }
-        activeBootFixConsent = bootFixConsent
-        activeBootFixCacheURL = bootFixCacheURL()
-        bootFixResultReceived = false
-
-        activeLaunchAllowedBootRecovery = allowBootRecovery
-        do {
-            try supervisor.start(
-                executableURL: launcherURL,
-                arguments: arguments,
-                environment: environment,
-                launchEvent: { [weak self] event in
-                    switch event {
-                    case .virtualMachineReady(let qmpSocketPath):
-                        self?.virtualMachineDidStart(qmpSocketPath: qmpSocketPath)
-                    case .launchProgress(let phase):
-                        self?.startMenuWindow?.launchDidProgress(to: phase)
-                    case .resetProgress:
-                        break
-                    }
+        if let factoryImage {
+            context.environment[QEMUGPURuntimeEnvironment.factoryImageKey] = factoryImage.path
+            launchedFactoryDirectories.append(factoryImage.deletingLastPathComponent())
+        }
+        activeStateRoot = context.stateRoot
+        try supervisor.start(
+            executableURL: launcherURL,
+            arguments: arguments,
+            environment: context.environment,
+            launchEvent: { [weak self] event in
+                switch event {
+                case .virtualMachineReady(let qmpSocketPath):
+                    self?.virtualMachineDidStart(qmpSocketPath: qmpSocketPath)
+                case .launchProgress(let phase):
+                    self?.startMenuWindow?.launchDidProgress(to: phase)
+                case .resetProgress:
+                    break
                 }
-            ) { [weak self] status in
-                self?.childDidExit(status: status)
             }
-        } catch {
-            activeLaunchAllowedBootRecovery = false
-            throw error
+        ) { [weak self] status in
+            self?.childDidExit(status: status)
         }
         childRunning = true
     }
@@ -751,17 +778,13 @@ final class VMApplicationController: NSObject, NSApplicationDelegate {
             catch { fputs("[startup] Could not retain Skip launcher: \(error.localizedDescription)\n", stderr) }
         }
         virtualMachineReachedStart = true
-        if !isDisposable {
-            activeBootFixCacheURL = GuestBootFixCache.url(storageRoot: activeStateRoot.map { URL(fileURLWithPath: $0) })
-        }
-        if activeBootFixConsent != nil, let identity = GuestBootFixCache.bundledIdentity {
-            let checking = GuestBootFixReport(schema: 1, type: "boot-fixes", identity: identity, state: "checking",
-                components: GuestBootFixReport.pendingComponents)
-            retainBootFixReport(checking)
-            bootFixResultTimer = Timer.scheduledTimer(withTimeInterval: 360, repeats: false) { [weak self] _ in
-                MainActor.assumeIsolated {
-                    self?.receivedBootFixReport(GuestBootFixReport(schema: 1, type: "boot-fixes", identity: identity,
-                        state: "unconfirmed", components: checking.components))
+        // The launcher has decompressed the factory by now, so a downloaded
+        // image is no longer needed.
+        if let identity = factoryManifest?.identity {
+            let directories = launchedFactoryDirectories
+            DispatchQueue.global(qos: .utility).async {
+                for directory in Set(directories) {
+                    FactoryImageStore.removeObsoleteDownloads(in: directory, identity: identity)
                 }
             }
         }
@@ -775,40 +798,13 @@ final class VMApplicationController: NSObject, NSApplicationDelegate {
         let settingsSocket = URL(fileURLWithPath: qmpSocketPath)
             .deletingLastPathComponent().appendingPathComponent("settings.sock").path
         do {
-            settingsBridge = try NativeSettingsBridge(socketPath: settingsSocket, migrationReport: { [weak self] report in
-                self?.receivedBootFixReport(report)
-            }) { [weak self] in
+            settingsBridge = try NativeSettingsBridge(socketPath: settingsSocket) { [weak self] in
                 self?.showRunningSettings() ?? false
             }
         } catch {
             // Settings access is optional; losing it must not stop a running VM.
             fputs("[settings] \(error.localizedDescription)\n", stderr)
         }
-    }
-
-    private func retainBootFixReport(_ report: GuestBootFixReport) {
-        do { try GuestBootFixCache.retain(report, cacheURL: activeBootFixCacheURL) }
-        catch { fputs("[boot-fixes] Could not retain result: \(error.localizedDescription)\n", stderr) }
-        if startMenuWindow?.window.isVisible == true { startMenuWindow?.refreshBootFixStatus() }
-    }
-
-    private func receivedBootFixReport(_ report: GuestBootFixReport) {
-        guard report.identity == GuestBootFixCache.bundledIdentity,
-              let catalog = GuestBootFixCatalog.bundled, report.matchesComponents(in: catalog) else { return }
-        // Reports are advisory results, never installation authorization.
-        retainBootFixReport(report)
-        guard activeBootFixConsent != nil, !bootFixResultReceived,
-              let result = GuestBootFixResult(report: report, catalog: catalog) else { return }
-        bootFixResultTimer?.invalidate()
-        bootFixResultTimer = nil
-        bootFixResultReceived = true
-        activationController.reconcile()
-        defer { activationController.reconcile() }
-        let alert = GuestBootFixPrompt.result(result)
-        isPresentingBlockingAlert = true
-        NSApp.activate(ignoringOtherApps: true)
-        alert.runModal()
-        isPresentingBlockingAlert = false
     }
 
     private func showRunningSettings() -> Bool {
@@ -912,17 +908,6 @@ final class VMApplicationController: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func supportsLanguageSelection() -> Bool {
-        if initialArguments.first == QEMUGPUStorageOption.ephemeral.rawValue {
-            return bundledMetrics?.supportsLanguageSelection ?? false
-        }
-        return QEMUGPUStorageSpaceEstimate.supportsLanguageSelection(
-            environment: baseEnvironment,
-            metrics: bundledMetrics,
-            preference: storageLocationStore.load()
-        )
-    }
-
     private func storageLocationMenuState() -> StorageLocationMenuState {
         StorageLocationMenuState.make(
             preference: storageLocationStore.load(),
@@ -950,8 +935,7 @@ final class VMApplicationController: NSObject, NSApplicationDelegate {
     }
 
     /// Returns an error message when the folder is rejected; otherwise stores
-    /// it. The existing VM is deliberately left where it is: copying tens of
-    /// gigabytes across volumes cannot use cloning and would be interruptible.
+    /// it. Selecting a location never copies or replaces a VM.
     private func chooseStorageLocation(_ path: String) -> String? {
         do {
             let resolution = try StorageLocationPolicy.validate(
@@ -966,6 +950,80 @@ final class VMApplicationController: NSObject, NSApplicationDelegate {
             return nil
         } catch {
             return error.localizedDescription
+        }
+    }
+
+    private var workspaceTransferProcess: Process?
+
+    private func moveStorageLocation(from source: String, to path: String,
+        progress: @escaping (VMTransferProgress) -> Void, completion: @escaping (String?) -> Void) {
+        guard !childRunning, storageEnvironmentOverride == nil,
+              let root = startupPreferenceRoot(), root.path == source,
+              let executable = Bundle.main.executableURL else {
+            completion("Shut down Omarchy before relocating its VM. Environment overrides must be removed first.")
+            return
+        }
+        // A separate process owns POSIX locks, so unrelated UI file reads
+        // cannot release them. Preferences change only after verified success.
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = ["--copy-vm", root.path, path]
+        let errors = Pipe()
+        process.standardError = errors
+        process.standardOutput = FileHandle.nullDevice
+        do { try process.run() }
+        catch { completion(error.localizedDescription); return }
+        workspaceTransferProcess = process
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let errorMessage: String
+            do {
+                errorMessage = try VMTransferOutput.read(from: errors.fileHandleForReading) { update in
+                    DispatchQueue.main.async { progress(update) }
+                }
+            } catch {
+                errorMessage = error.localizedDescription
+                if process.isRunning { process.terminate() }
+            }
+            process.waitUntilExit()
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.workspaceTransferProcess = nil
+                guard process.terminationStatus == 0 else {
+                    completion(errorMessage.isEmpty
+                        ? "VM relocation failed. The original VM and selected location were retained."
+                        : errorMessage)
+                    return
+                }
+                completion(self.chooseStorageLocation(path))
+            }
+        }
+    }
+
+    private func deleteStorageLocation(_ source: String, identity: String, completion: @escaping (String?) -> Void) {
+        guard !childRunning, workspaceTransferProcess == nil, storageEnvironmentOverride == nil,
+              startupPreferenceRoot()?.path == source, let executable = Bundle.main.executableURL else {
+            completion("Shut down Omarchy before deleting its VM. The selected VM must match the confirmed folder.")
+            return
+        }
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = ["--trash-vm", source, identity]
+        let errors = Pipe()
+        process.standardError = errors
+        process.standardOutput = FileHandle.nullDevice
+        do { try process.run() }
+        catch { completion(error.localizedDescription); return }
+        workspaceTransferProcess = process
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let message: String
+            do { message = try VMTransferOutput.read(from: errors.fileHandleForReading) { _ in } }
+            catch { message = error.localizedDescription; if process.isRunning { process.terminate() } }
+            process.waitUntilExit()
+            DispatchQueue.main.async { [weak self] in
+                self?.workspaceTransferProcess = nil
+                completion(process.terminationStatus == 0 ? nil :
+                    (message.isEmpty ? "Could not move this VM to Trash. The selected folder was retained." : message))
+            }
         }
     }
 
@@ -1203,22 +1261,6 @@ final class VMApplicationController: NSObject, NSApplicationDelegate {
             startMenuWindow?.dismiss()
             startMenuWindow = nil
         }
-        let launchAllowedBootRecovery = activeLaunchAllowedBootRecovery
-        let bootFixConsent = activeBootFixConsent
-        bootFixResultTimer?.invalidate()
-        bootFixResultTimer = nil
-        if activeBootFixConsent != nil, !bootFixResultReceived, let identity = GuestBootFixCache.bundledIdentity {
-            let report = GuestBootFixReport(schema: 1, type: "boot-fixes", identity: identity, state: "unconfirmed",
-                components: GuestBootFixReport.pendingComponents)
-            if virtualMachineReachedStart, !applicationTerminationPending {
-                receivedBootFixReport(report)
-            } else {
-                retainBootFixReport(report)
-            }
-        }
-        activeBootFixConsent = nil
-        activeBootFixCacheURL = nil
-        activeLaunchAllowedBootRecovery = false
         cancelHostWakeRetry()
         hostSleepCoordinator.disconnect()
         let recentStandardError = supervisor.recentStandardError
@@ -1264,47 +1306,6 @@ final class VMApplicationController: NSObject, NSApplicationDelegate {
                ) {
                 startMenuWindow.launchDidFail(errorMessage: portFailure)
                 return
-            }
-            if presentation.requiresWorkspaceReset {
-                startMenuWindow?.launchRequiresReset()
-                return
-            }
-            switch BootRecoveryChildExitGate.decide(
-                presentation: presentation,
-                launchWasAuthorized: launchAllowedBootRecovery
-            ) {
-            case .reportFailure:
-                startMenuWindow?.launchDidFail(
-                    errorMessage: "Try Omarchy could not complete the one-time boot-file pairing. The saved VM was not reset or upgraded. You can safely try again."
-                )
-                return
-            case .requestConfirmation:
-                switch BootRecoveryLaunchGate.decide(
-                    preflight: .requiresConfirmation,
-                    confirm: { [weak self] in
-                        self?.startMenuWindow?.confirmBootRecovery() ?? false
-                    }
-                ) {
-                case .cancel:
-                    startMenuWindow?.launchDidAbort()
-                case .launch:
-                    // Retry the same configured workspace directly. Re-running
-                    // availability resolution here could offer to switch from
-                    // a just-disconnected external VM to the default one, then
-                    // accidentally spend consent on a different saved disk.
-                    do {
-                        try launch(
-                            arguments: launchArguments(),
-                            allowBootRecovery: true,
-                            bootFixConsent: bootFixConsent
-                        )
-                    } catch {
-                        failLaunch(error)
-                    }
-                }
-                return
-            case .unrelated:
-                break
             }
             if presentation.showsStartupFailure {
                 let message = VMStartupFailure.message(

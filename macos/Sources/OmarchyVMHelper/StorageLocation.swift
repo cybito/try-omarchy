@@ -54,14 +54,16 @@ struct StorageLocationPreferenceStore {
     }
 }
 
-/// The identity and disk sizes `build-app.sh` signs into
-/// `Resources/guest/launch.plist`. The app needs them to say how much room a
-/// chosen volume must have before the launcher tries to use it.
+/// The factory identity and disk sizes from `Resources/guest/factory.json`.
+/// The app needs them to say how much room a chosen volume must have before
+/// the launcher tries to use it.
 struct BundledGuestMetrics: Equatable {
     var identity: String
     var sourceDiskBytes: Int64
     var workingDiskBytes: Int64
-    var supportsLanguageSelection: Bool = false
+    /// The compressed image a release app downloads before its first VM; it
+    /// sits beside the decompressed factory until the VM has started.
+    var downloadBytes: Int64 = 0
 }
 
 /// How much room the workspace needs on the chosen volume.
@@ -72,12 +74,13 @@ struct BundledGuestMetrics: Equatable {
 struct StorageSpaceRequirement: Equatable {
     var sourceBytes: Int64
     var workingBytes: Int64
+    var downloadBytes: Int64 = 0
 
     static let headroomBytes: Int64 = 1_073_741_824
 
     /// Below this the workspace cannot even be created.
     var floorBytes: Int64 {
-        sourceBytes + Self.headroomBytes
+        sourceBytes + downloadBytes + Self.headroomBytes
     }
 
     /// Below this the VM starts but the guest can run out of room later.
@@ -156,16 +159,15 @@ enum StorageLocationPolicy {
     static let workspaceDirectoryName = "Try Omarchy"
     static let rootMarkerName = ".omarchy-qemu-storage"
 
-    /// The marker's only valid contents. Kept byte-identical to
-    /// `QEMU_PERSISTENT_STORAGE_ROOT_MARKER` in qemu-persistent-storage.sh,
-    /// which is the side that writes it. Change one and you must change both;
+    /// The marker's only valid contents. Kept byte-identical to the marker
+    /// run-qemu-gpu.sh writes. Change one and you must change both;
     /// StorageLocationContractTests pins them together.
     static let rootMarkerContent = "omarchy-qemu-storage-root-v1"
 
     /// Kept byte-identical to `validatedConfiguredRoot` in QEMUGPULauncher.swift
-    /// and `_qps_assert_safe_root_path` in qemu-persistent-storage.sh. Change
-    /// one and you must change all three.
-    static let unsafeRoots: Set<String> = ["/", "/Users", "/private", "/private/tmp", "/tmp"]
+    /// and the storage-location check in run-qemu-gpu.sh. Change one and you
+    /// must change all three.
+    static let unsafeRoots: Set<String> = ["/", "/Users", "/private", "/private/tmp", "/tmp", "/Volumes"]
 
     /// Normalizes a chosen container path. The container itself is always the
     /// workspace root — `validate` below is what decides whether a container
@@ -180,8 +182,8 @@ enum StorageLocationPolicy {
 
     /// Whether the marker is one this app would itself have written.
     ///
-    /// Mirrors `_qps_validate_root_marker` plus `_qps_assert_private_regular_file`
-    /// in qemu-persistent-storage.sh exactly. Checking only that *something*
+    /// Mirrors the marker check in run-qemu-gpu.sh, which runs with umask 077,
+    /// so the marker it writes is a private regular file. Checking only that *something*
     /// named `.omarchy-qemu-storage` exists would let the picker accept a folder
     /// the launcher then refuses, moving the failure from a message the user can
     /// act on to one the shell script prints mid-launch.
@@ -192,9 +194,8 @@ enum StorageLocationPolicy {
         guard Darwin.lstat(marker.path, &information) == 0 else { return false }
         guard (information.st_mode & S_IFMT) == S_IFREG else { return false }
         guard information.st_uid == getuid() else { return false }
-        // `_qps_permissions` is `stat -f '%Lp'`, which reports only the nine
-        // permission bits — a setuid marker prints 600 there — so masking with
-        // 0o777 is the exact mirror, not a laxer one.
+        // Only the nine permission bits matter, so a setuid marker still
+        // reads as 600.
         guard (information.st_mode & 0o777) == 0o600 else { return false }
 
         guard let data = try? Data(contentsOf: marker),
@@ -305,15 +306,12 @@ enum StorageLocationPolicy {
 
         var warning: String?
         let hasRecordedPersistentDisk = isExistingWorkspace
-            && QEMUGPUStorageSpaceEstimate.hasRecordedPersistentDisk(
-                stateRoot: root,
-                bundleIdentity: metrics?.identity,
-                fileManager: fileManager
-            )
+            && QEMUGPUStorageSpaceEstimate.hasRecordedPersistentDisk(stateRoot: root, fileManager: fileManager)
         if let metrics, !hasRecordedPersistentDisk {
             let requirement = StorageSpaceRequirement(
                 sourceBytes: metrics.sourceDiskBytes,
-                workingBytes: metrics.workingDiskBytes
+                workingBytes: metrics.workingDiskBytes,
+                downloadBytes: metrics.downloadBytes
             )
             guard capabilities.availableBytes >= requirement.floorBytes else {
                 throw StorageLocationPolicyError.insufficientSpace(

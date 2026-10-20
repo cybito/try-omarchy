@@ -8,11 +8,17 @@ Usage: macos/build-app.sh [--open] [--dmg] [--guest-dir DIR]
                                   [--configuration development|production]
                                   [--sign-identity IDENTITY]
                                   [--notarize-profile PROFILE]
+                                  [--factory-download-url URL]
 
 Build a self-contained Apple Silicon app. Development builds select a stable
 local signing certificate automatically. Production builds require an explicit
 signing identity. --dmg requires --configuration production.
 --notarize-profile implies --dmg and names a notarytool keychain profile.
+
+Development builds carry the compressed factory. Production builds, and any
+build given --factory-download-url, carry a download manifest instead and write
+the image's parts to dist/factory/ for upload beside the DMG. Production builds
+default to the GitHub release of HEAD's vX.Y.Z tag.
 EOF
   exit 64
 }
@@ -23,6 +29,7 @@ guest_dir=
 configuration=development
 sign_identity=${OMARCHY_CODESIGN_IDENTITY:-auto}
 notarize_profile=
+factory_download_url=
 while (($#)); do
   case "$1" in
     --open) open_app=1; shift ;;
@@ -46,6 +53,11 @@ while (($#)); do
       (($# >= 2)) || usage
       notarize_profile=$2
       build_dmg=1
+      shift 2
+      ;;
+    --factory-download-url)
+      (($# >= 2)) || usage
+      factory_download_url=$2
       shift 2
       ;;
     *) usage ;;
@@ -77,6 +89,14 @@ case "$configuration" in
       echo 'build-app: production requires --sign-identity (use - for an explicit ad-hoc test build)' >&2
       exit 1
     }
+    # The app downloads its factory from the release it ships in.
+    if [[ -z $factory_download_url ]]; then
+      release_tag=$(git -C "$repo_dir" describe --tags --exact-match --match 'v[0-9]*.[0-9]*.[0-9]*' HEAD 2>/dev/null) || {
+        echo 'build-app: production downloads the factory from the release of HEAD'"'"'s vX.Y.Z tag; tag HEAD or pass --factory-download-url' >&2
+        exit 1
+      }
+      factory_download_url="https://github.com/omacom/try-omarchy/releases/download/$release_tag/"
+    fi
     ;;
   *) usage ;;
 esac
@@ -91,6 +111,7 @@ bundled_qemu="$contents/Resources/runtime/bin/Try Omarchy"
 module_cache="$macos_dir/.build/module-cache"
 runtime_source="$macos_dir/.build/qemu-gpu-runtime"
 guest_dir=${guest_dir:-"$repo_dir/dist/guest"}
+firmware_source="$macos_dir/.build/firmware"
 dependency_bundler="$macos_dir/bundle-macho-dependencies.sh"
 compatibility_verifier="$macos_dir/verify-macos-compatibility.sh"
 package_dmg="$macos_dir/package-dmg.sh"
@@ -110,6 +131,16 @@ generated_icon="$macos_dir/.build/TryOmarchy.icns"
   exit 1
 }
 guest_dir=$(cd "$guest_dir" && pwd -P)
+# The factory (guest/factory) boots through UEFI firmware; see docs/architecture.md.
+[[ -f $guest_dir/factory.json && ! -L $guest_dir/factory.json ]] || {
+  echo "build-app: $guest_dir has no factory.json; run make guest" >&2
+  exit 1
+}
+guest_packages=${OMARCHY_GUEST_PACKAGES:-"$guest_dir/packages"}
+[[ -f $firmware_source/edk2-aarch64-code.fd && -f $firmware_source/edk2-licenses.txt ]] || {
+  echo "build-app: missing UEFI firmware; run make firmware" >&2
+  exit 1
+}
 [[ -x $dependency_bundler && ! -L $dependency_bundler ]] || {
   echo "build-app: dependency bundler is missing or unsafe" >&2
   exit 1
@@ -232,67 +263,43 @@ install -m 0644 "$repo_dir/LICENSE" "$contents/Resources/LICENSE"
 install -m 0644 "$generated_icon" "$contents/Resources/TryOmarchy.icns"
 ditto "$runtime_source" "$contents/Resources/runtime"
 install -m 0755 "$macos_dir/run-qemu-gpu.sh" "$contents/Resources/scripts/run-qemu-gpu.sh"
-install -m 0755 "$repo_dir/guest/native-overlay/usr/local/sbin/try-omarchy-migrate-alacritty" \
-  "$contents/Resources/scripts/try-omarchy-migrate-alacritty"
-install -m 0644 "$macos_dir/qemu-persistent-storage.sh" \
-  "$contents/Resources/scripts/qemu-persistent-storage.sh"
 install -m 0644 "$macos_dir/qemu-port-forwarding.sh" \
   "$contents/Resources/scripts/qemu-port-forwarding.sh"
 install -m 0644 "$macos_dir/qemu-networking.sh" "$contents/Resources/scripts/qemu-networking.sh"
-# Ship settings and the shared-folder safety helper to existing VMs at boot.
-settings_payload="$contents/Resources/guest-settings"
-mkdir -p "$settings_payload"
-install -m 0644 "$macos_dir/guest-settings.service" "$settings_payload/guest-settings.service"
-install -m 0644 "$repo_dir/guest/scripts/install-settings-integration.py" "$settings_payload/install.py"
-install -m 0644 "$repo_dir/guest/scripts/migrate-boot-fixes.py" "$settings_payload/migrate.py"
-install -m 0644 "$repo_dir/guest/native-overlay/usr/local/sbin/try-omarchy-migrate-alacritty" "$settings_payload/try-omarchy-migrate-alacritty"
-for relative in \
-  usr/local/share/try-omarchy/power-profile-hooks.json \
-  usr/local/lib/try-omarchy/install-power-profile.py \
-  usr/local/bin/omarchy-native-mac-share \
-  usr/local/bin/omarchy-native-settings \
-  usr/local/bin/omarchy-native-clipboard-bridge \
-  usr/bin/omarchy-screensaver \
-  usr/local/bin/omarchy-native-screensaver-text \
-  usr/local/bin/omarchy-native-cursor-restore \
-  usr/local/bin/try-omarchy-timezone \
-  usr/local/share/try-omarchy/timezone-setup.sh \
-  usr/local/share/try-omarchy/timezone-menu-hooks.json \
-  usr/local/lib/try-omarchy/install-timezone-menus.py \
-  usr/local/bin/tzupdate \
-  usr/lib/systemd/system/try-omarchy-timezone.service \
-  etc/udev/rules.d/96-try-omarchy-timezone.rules \
-  etc/udev/rules.d/92-omarchy-native-settings.rules \
-  usr/share/applications/try-omarchy-settings.desktop \
-  usr/share/applications/try-omarchy-follow-timezone.desktop \
-  etc/skel/.config/omarchy/extensions/omarchy-menu.jsonc; do
-  install -m 0644 "$repo_dir/guest/native-overlay/$relative" "$settings_payload/${relative##*/}"
-done
-python3 "$repo_dir/guest/scripts/boot-fix-components.py" --payload "$repo_dir/guest" "$settings_payload"
-python3 "$repo_dir/guest/scripts/migrate-boot-fixes.py" --manifest "$settings_payload"
 install -m 0644 "$macos_dir/network-identity.py" "$contents/Resources/scripts/network-identity.py"
-python3 "$repo_dir/integrations/build-bundle.py" "$contents/Resources/integrations"
-for guest_resource in \
-  LICENSE.omarchy \
-  SHA256SUMS \
-  build-spec.json \
-  guest-manifest.json \
-  initramfs-linux.img \
-  packages.lock.txt \
-  provenance.json \
-  rootfs.ext4.zst \
-  vmlinuz-linux; do
+compressed_name=$(/usr/bin/plutil -extract compressed.path raw -o - "$guest_dir/factory.json")
+guest_resources=(factory.json packages.txt SHA256SUMS)
+if [[ -n $factory_download_url ]]; then
+  # The image is over GitHub's 2 GiB asset limit and is only needed for a new
+  # VM, so the app downloads it (FactoryImageDownload.swift).
+  python3 "$repo_dir/scripts/split-factory-image.py" \
+    --guest-dir "$guest_dir" --base-url "$factory_download_url" \
+    --output "$repo_dir/dist/factory" --manifest "$contents/Resources/guest/download.json"
+  chmod 0644 "$contents/Resources/guest/download.json"
+else
+  guest_resources+=("$compressed_name")
+fi
+for guest_resource in "${guest_resources[@]}"; do
   [[ -f $guest_dir/$guest_resource && ! -L $guest_dir/$guest_resource ]] || {
     echo "build-app: factory guest resource is missing or unsafe: $guest_resource" >&2
     exit 1
   }
-  if [[ $guest_resource == rootfs.ext4.zst ]]; then
-    cp -c "$guest_dir/$guest_resource" "$contents/Resources/guest/$guest_resource"
-  else
-    cp "$guest_dir/$guest_resource" "$contents/Resources/guest/$guest_resource"
-  fi
+  cp -c "$guest_dir/$guest_resource" "$contents/Resources/guest/$guest_resource"
   chmod 0644 "$contents/Resources/guest/$guest_resource"
 done
+# The try-omarchy package the launcher offers the guest on every boot.
+mkdir -p "$contents/Resources/guest-packages"
+shopt -s nullglob
+packages=("$guest_packages"/try-omarchy-*.pkg.tar.zst)
+shopt -u nullglob
+((${#packages[@]} == 1)) || {
+  echo "build-app: expected exactly one try-omarchy package in $guest_packages" >&2
+  exit 1
+}
+install -m 0644 "${packages[0]}" "$contents/Resources/guest-packages/"
+mkdir -p "$contents/Resources/firmware"
+install -m 0644 "$firmware_source/edk2-aarch64-code.fd" "$firmware_source/edk2-licenses.txt" \
+  "$contents/Resources/firmware/"
 
 mv "$contents/Resources/runtime/bin/qemu-system-aarch64" "$bundled_qemu"
 "$dependency_bundler" --verify-only "$contents/Resources/runtime"
@@ -328,18 +335,11 @@ codesign "${app_sign_options[@]}" \
   --entitlements "$macos_dir/omarchy-vm-helper.entitlements" \
   "$contents/MacOS/omarchy-vm-helper"
 
-launch_record=$(OMARCHY_QEMU_GPU_INSPECT_ONLY=1 \
-  "$contents/Resources/scripts/run-qemu-gpu.sh")
-IFS=$'\t' read -r bundle_identity source_disk_sha source_disk_bytes \
-  compressed_disk_bytes working_disk_bytes kernel_command_line <<<"$launch_record"
-launch_configuration="$contents/Resources/guest/launch.plist"
-/usr/bin/plutil -create xml1 "$launch_configuration"
-/usr/bin/plutil -insert bundleIdentity -string "$bundle_identity" "$launch_configuration"
-/usr/bin/plutil -insert sourceDiskSHA256 -string "$source_disk_sha" "$launch_configuration"
-/usr/bin/plutil -insert sourceDiskBytes -integer "$source_disk_bytes" "$launch_configuration"
-/usr/bin/plutil -insert compressedDiskBytes -integer "$compressed_disk_bytes" "$launch_configuration"
-/usr/bin/plutil -insert workingDiskBytes -integer "$working_disk_bytes" "$launch_configuration"
-/usr/bin/plutil -insert kernelCommandLine -string "$kernel_command_line" "$launch_configuration"
+# The launcher must accept the factory it ships with.
+OMARCHY_QEMU_GPU_INSPECT_ONLY=1 "$contents/Resources/scripts/run-qemu-gpu.sh" >/dev/null || {
+  echo "build-app: the bundled launcher rejects the factory" >&2
+  exit 1
+}
 
 codesign "${app_sign_options[@]}" \
   --entitlements "$macos_dir/omarchy-vm-helper.entitlements" \

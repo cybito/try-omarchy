@@ -1,0 +1,83 @@
+# Nightly: a new factory disk from Omarchy's live repositories, checked the way
+# a user meets it (guest/tests/desktop/run.sh) with every app the checks
+# install. It catches changes in Omarchy before users do, and its factory disk
+# is what the next day's pull requests boot (ci.yml's Guest desktop job), so
+# only the newest one is kept in the cache. Run it by hand from the Actions tab
+# after a change to Omarchy that should not wait for the night.
+name: Guest desktop
+
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: guest-desktop-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  desktop:
+    name: New factory on a virtual display
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Restore the builder image
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/builder-image.tar.zst
+          key: guest-builder-${{ hashFiles('guest/factory/Containerfile', 'guest/keys/**', 'guest/vendor/**') }}
+
+      - name: Build the factory disk
+        env:
+          GUEST_BUILDER_IMAGE: try-omarchy-guest-builder
+        run: |
+          guest/tests/builder-image.sh "$RUNNER_TEMP/builder-image.tar.zst"
+          guest/build.sh --output "$RUNNER_TEMP/factory"
+
+      - name: Install systemd-nspawn
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq --no-install-recommends systemd-container
+
+      - name: Boot and check the userland
+        run: |
+          sudo env CI_INSTALLS="ghostty kitty 1password vscode signal" \
+            guest/tests/desktop/run.sh "$RUNNER_TEMP/factory" "$RUNNER_TEMP/desktop"
+
+      # Pull requests boot this factory; a broken one is not kept.
+      - name: Keep the factory disk for pull requests
+        if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/factory
+          key: guest-factory-${{ hashFiles('guest/factory/**', 'guest/build.sh', 'guest/keys/**', 'guest/vendor/**') }}-${{ github.run_id }}
+
+      - name: Drop older factory disks from the cache
+        if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP: guest-factory-${{ hashFiles('guest/factory/**', 'guest/build.sh', 'guest/keys/**', 'guest/vendor/**') }}-${{ github.run_id }}
+        run: |
+          gh cache list --repo "$GITHUB_REPOSITORY" --key guest-factory- --ref "$GITHUB_REF" --limit 100 --json id,key \
+            --jq ".[] | select(.key != \"$KEEP\") | .id" |
+            while read -r id; do gh cache delete --repo "$GITHUB_REPOSITORY" "$id"; done
+
+      - name: Summary
+        if: always()
+        run: cat "$RUNNER_TEMP/desktop/results.md" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+      - name: Keep screenshots and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop
+          path: ${{ runner.temp }}/desktop
+          retention-days: 14

@@ -6,6 +6,21 @@ graphics therefore still have command translation, synchronization, upload, and
 presentation costs. See [architecture](architecture.md) and QEMU's
 [virtio-gpu documentation](https://www.qemu.org/docs/master/system/devices/virtio/virtio-gpu.html).
 
+## App Nap
+
+macOS naps an app none of whose windows can be seen: the screen locked, the
+VM's full screen on another Space, the window minimized or covered. A napped
+QEMU runs every thread, the vCPUs too, at background priority, and the guest
+slows to a fraction of its speed. OmacVM, which runs the same QEMU/HVF/VirGL
+stack, measured 2–20 % of normal guest speed with the Mac's screen locked.
+
+`macos/patches/qemu-cocoa-no-app-nap.patch` makes QEMU's window process hold an
+`NSProcessInfo` activity (`NSActivityUserInitiatedAllowingIdleSystemSleep`) for
+the whole run, so the VM keeps working out of sight while an idle Mac can still
+sleep. The app pauses the VM for Mac sleep on its own. QEMU's log says "Try
+Omarchy: App Nap off while the VM runs". `TRYOMARCHY_APP_NAP=1` in QEMU's
+environment leaves the activity out, to measure the difference.
+
 ## Reproducible resource measurements
 
 `scripts/profile-process.py` reads interval CPU counters and memory accounting on
@@ -70,6 +85,11 @@ Offscreen synchronous graphics throughput does not establish on-screen FPS or
 input latency. Do not infer hardware video decoding from an accelerated desktop.
 
 ## 2026-10-01 investigation
+
+This investigation ran on the earlier direct-boot guest (a pinned, patched
+Omarchy image). The host runtime findings still apply. Commands it lists that
+no longer exist, such as `make update-omarchy`, the old guest package lock and
+`hvf-memory-reclaim-smoke.py`, are kept as the record of what ran then.
 
 Host: M2 Pro, ten cores (six performance/four efficiency), 16 GiB, macOS 27.0.1.
 Source: `prepare-0.5.0`, initially `3cfee41`; optimization checkpoint `0bd5348`, Bash compatibility fix `3e24c17`.

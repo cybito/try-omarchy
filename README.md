@@ -6,18 +6,43 @@
 
 Run the upstream [Omarchy](https://github.com/basecamp/omarchy) desktop as a native, hardware-accelerated app on an Apple Silicon Mac.
 
-Try Omarchy packages a project-built ARM64 Arch Linux image configured with Omarchy Quattro, a QEMU runtime using Apple Hypervisor Framework, and a small Swift/AppKit launcher into one macOS app. The image is built from pinned Arch Linux ARM packages and a pinned revision of the upstream Omarchy source. Temporary fixes carried ahead of the next upstream release are enumerated with strict hashes in the guest build spec and artifact provenance.
+Try Omarchy packages a stock `aarch64` Omarchy install, a QEMU runtime using Apple Hypervisor Framework with UEFI firmware, and a small Swift/AppKit launcher into one macOS app. The factory disk is installed from Omarchy's own package repositories with Omarchy's own install steps. Everything Try Omarchy adds inside Linux is one pacman package, `try-omarchy`. Omarchy then updates itself inside the VM with `omarchy update`, kernel included. On ARM, Omarchy publishes to its `edge` channel for now.
 
-<img width="800" src="https://github.com/user-attachments/assets/1368a8f5-5099-43e4-8d3b-3d7d7fba0326" />
+<img width="1920" height="1173" alt="Try Omarchy on a MacBook Pro" src="https://github.com/user-attachments/assets/44f67c59-ba85-4819-8905-71b188bc02fe" />
 
 The Omarchy mark in the app icon is sourced from the
 [official Omarchy brand kit](https://omarchy.org/brand/) and remains subject to
 Omarchy's trademark rights.
 
+## Quick start
+
+1. Open [Releases](https://github.com/omacom/try-omarchy/releases) and download the latest signed and notarized `.dmg`.
+2. Open the DMG and drag **Try Omarchy** to **Applications**.
+3. Launch **Try Omarchy** from Applications.
+
+The first launch downloads the Omarchy image (about 3 GB) from the same GitHub
+release before it creates the VM; the launch button shows its progress. An
+interrupted download, from a lost connection, sleep or quitting the app,
+continues where it stopped on the next launch, and every part is checked
+against its SHA-256 digest before it is used. The volume needs room for the
+image and the prepared disk (about 15 GB); the download stops with 1 GB still
+free rather than filling the disk.
+
+By default, every launch begins at the launcher. Enable **Skip launcher** to start Omarchy using your saved settings on subsequent launches. A confirmation explains how to return to the launcher; choose **OK** to enable **Skip launcher** or **Cancel** to leave it off. Hold **Option** while opening the app to show the launcher again and change settings or turn **Skip launcher** off. You can also open **Setup → Try Omarchy Settings** inside Omarchy. Skip launcher is saved with the VM workspace; deleting that workspace clears the choice. A missing VM disk always shows the launcher, even if its settings file remains. Reset requests still show the confirmation flow. Startup checks still show any error dialogs.
+
+While that menu is open, Try Omarchy behaves like a regular Mac app. **Try Omarchy → Settings…** (**Command-comma**) brings the launcher or its open editor forward without discarding drafts. The menus also provide standard text editing, Services, Hide Others, Show All, and window commands, including Bring All to Front. **Help** opens the user guide, maintenance and recovery notes, or the issue tracker in your browser. After the VM starts, that native app chrome steps aside for Omarchy. **Immersive** is on by default, so Omarchy opens Full Screen with the Mac menu bar and Dock hidden. Turn it off to open a resizable window; if you later enter Full Screen, the Mac menu bar and Dock remain available at the screen edges. Whenever the Omarchy window is focused, Command belongs to the guest as Super in either mode; Accessibility permission lets system shortcuts such as Command-Space reach it before macOS. Microphone and camera access are optional. The first launch takes longer while the app prepares Linux and starts Omarchy's account provisioning.
+
+Inside Omarchy, choose **Setup → Try Omarchy Settings**, search for **Try Omarchy Settings**, or run `omarchy-native-settings` to reopen the Mac settings window. You can change **Skip launcher**, permissions, CPU, memory, sharing, port forwarding, and immersive mode here. CPU, memory, sharing, ports, and immersive mode are saved for the next launch; **Restart Omarchy** shuts down Linux and starts a new VM process to apply them. Save your work first. A disposable VM keeps its disk across this restart until you close the app.
+
+For VM location and reset, choose **Shut Down**. The settings window stays open even with **Skip launcher** enabled; reset still asks for confirmation. **Done** or closing the running settings window returns to Omarchy without stopping it.
+
+Restarting from inside Omarchy reboots the guest in the same Try Omarchy app.
+Shutting down Omarchy closes the app and leaves it closed.
+
 ## Highlights
 
 - Hardware-accelerated ARM64 virtualization and VirGL graphics
-- Nested KVM virtualization on M3 and newer Apple Silicon running macOS 26+
+- Opt-in nested KVM virtualization on M3 and newer Apple Silicon running macOS 26+
 - Resizable native window with automatic guest resolution and HiDPI scale updates
 - Mac audio input/output selection inside Omarchy, with live routing and system-default fallback
 - FaceTime HD and other Mac cameras exposed to Omarchy as an on-demand 720p webcam
@@ -132,23 +157,6 @@ Window resize across a HiDPI boundary, Mac output-device switching mid-session,
 the shared folder, and clipboard sharing have not been exercised since the
 port. The `dtc` mirror should be reverted once kernel.org returns.
 
-## Quick start
-
-1. Open [Releases](https://github.com/omacom/try-omarchy/releases) and download the latest signed and notarized `.dmg`.
-2. Open the DMG and drag **Try Omarchy** to **Applications**.
-3. Launch **Try Omarchy** from Applications.
-
-By default, every launch begins at the launcher. Enable **Skip launcher** to start Omarchy using your saved settings on subsequent launches. A confirmation explains how to return to the launcher; choose **OK** to enable **Skip launcher** or **Cancel** to leave it off. Hold **Option** while opening the app to show the launcher again and change settings or turn **Skip launcher** off. You can also open **Setup → Try Omarchy Settings** inside Omarchy. Skip launcher is saved with the VM workspace; deleting that workspace clears the choice. A missing VM disk always shows the launcher, even if its settings file remains. Reset requests still show the confirmation flow. Startup checks still show any required recovery or error dialogs.
-
-While that menu is open, Try Omarchy behaves like a regular Mac app. **Try Omarchy → Settings…** (**Command-comma**) brings the launcher or its open editor forward without discarding drafts. The menus also provide standard text editing, Services, Hide Others, Show All, and window commands, including Bring All to Front. **Help** opens the user guide, maintenance and recovery notes, or the issue tracker in your browser. After the VM starts, that native app chrome steps aside for Omarchy. **Immersive** is on by default, so Omarchy opens Full Screen with the Mac menu bar and Dock hidden. Turn it off to open a resizable window; if you later enter Full Screen, the Mac menu bar and Dock remain available at the screen edges. Whenever the Omarchy window is focused, Command belongs to the guest as Super in either mode; Accessibility permission lets system shortcuts such as Command-Space reach it before macOS. Microphone and camera access are optional. The first launch takes longer while the app prepares Linux and starts Omarchy's account provisioning.
-
-Inside Omarchy, choose **Setup → Try Omarchy Settings**, search for **Try Omarchy Settings**, or run `omarchy-native-settings` to reopen the Mac settings window. You can change **Skip launcher**, permissions, CPU, memory, sharing, port forwarding, and immersive mode here. CPU, memory, sharing, ports, and immersive mode are saved for the next launch; **Restart Omarchy** shuts down Linux and starts a new VM process to apply them. Save your work first. A disposable VM keeps its disk across this restart until you close the app.
-
-For VM location and reset, choose **Shut Down**. The settings window stays open even with **Skip launcher** enabled; reset still asks for confirmation. **Done** or closing the running settings window returns to Omarchy without stopping it. Existing VMs [receive settings access automatically](guest/README.md#settings-access-from-an-existing-vm) when launched with the updated app, without a reset or manual installation.
-
-Restarting from inside Omarchy reboots the guest in the same Try Omarchy app.
-Shutting down Omarchy closes the app and leaves it closed.
-
 ## Virtual machine resources
 
 Choose **Resources → Configure…** on the start menu to adjust processor cores
@@ -165,37 +173,24 @@ use 256 GiB on the Mac. The volume still needs free space as the VM fills it;
 the maximum is guest capacity, not a quota on backups or total app storage.
 
 Keep the displayed value to retain the current capacity. Larger values sparsely
-extend the stopped disk at the next launch; the guest expands its root filesystem
-on boot. Existing disks cannot
-shrink. **Use Defaults** selects 64 GiB, or the existing capacity if larger.
-Previously saved settings without a disk maximum retain their current capacity.
-A disk previously grown with the CLI remains at least that large. For direct launcher script usage,
-set `OMARCHY_QEMU_GPU_DISK_GIB=256`.
+extend the stopped disk at the next launch; the guest grows its root partition
+and btrfs filesystem on boot. Existing disks cannot shrink. **Use Defaults**
+selects 64 GiB, or the existing capacity if larger. Previously saved settings
+without a disk maximum retain their current capacity. For direct launcher
+script usage, set `OMARCHY_QEMU_GPU_DISK_GIB=256`.
 
 **Save** remembers these choices. **Cancel** leaves them unchanged, and
 **Use Defaults** restores the draft until you save. Existing memory preferences
 are carried forward. A choice that no longer fits a smaller Mac falls back to
 its default without erasing the saved choice.
 
-## Ghostty
+## Ghostty and 1Password
 
-Choose **Install → Terminal → Ghostty** to download verified Ghostty sources
-and build an ARM64 package inside the guest. The first build takes several
-minutes and needs at least 3 GiB free. The installer uses software rendering
-for compatibility with the VM. See [installation, existing VMs and limitations](docs/ghostty.md).
-
-## 1Password
-
-Install 1Password from the Omarchy menu. On ARM64 guests, Try Omarchy downloads
-the current official 1Password application, verifies its signature against the
-pinned 1Password signing key, and installs the ARM64 CLI package. Its launcher
-uses software rendering to avoid the virtual GPU incompatibility affecting the
-Electron interface.
-
-After signing in, use these global shortcuts:
-
-- `Ctrl + Shift + Space` — open 1Password Quick Access
-- `Super + Shift + /` — open the full 1Password app
+Both are ordinary Omarchy packages on ARM: install them from the Omarchy menu
+(**Install → Terminal → Ghostty**, **Install → Service → 1Password**). Try
+Omarchy no longer ships its own installers for them. Ghostty runs on the
+software renderer because the VM's graphics path lacks the OpenGL version it
+needs; see [Ghostty](docs/ghostty.md).
 
 ## Camera sharing
 
@@ -229,10 +224,10 @@ provisioning. Additional guest accounts can reach the same share, with each
 entry's normal Unix permission bits deciding whether they can modify it.
 
 The share uses `cache=readahead` to avoid the 9p writeback corruption risk in
-older guest kernels. Writable shared memory mappings are unavailable; keep
+some guest kernels. Writable shared memory mappings are unavailable; keep
 databases and mmap-based IPC files on the guest's local disk. See
-[shared-folder safety](docs/shared-folder-safety.md) for existing-VM protection,
-verification, and mitigation on older app versions.
+[shared-folder safety](docs/shared-folder-safety.md) for the mount policy and
+how to verify it.
 
 ## Passing a USB device to Omarchy (experimental)
 
@@ -386,7 +381,7 @@ copy as a separate VM, generate a new MAC before running both copies. Move or
 restore the complete data folder to retain the identity; importing only a disk
 into a new workspace does not transfer its network identity. Ephemeral bridged
 VMs receive a fresh address on each launch. Damaged identity records produce an
-error instead of silently changing the MAC. Migration and regeneration retain
+error instead of silently changing the MAC. Regeneration retains
 the preceding record as `network-identities/current.previous.json` in the VM
 data folder; restore a known-good record only with the VM stopped.
 
@@ -432,9 +427,10 @@ The reverse direction does not need a mapping. From Omarchy, connect to
 
 After completing Omarchy's first-boot account setup, open **Port forwarding**,
 choose **Add SSH**, and save the prefilled TCP mapping from Mac port `2222` to
-Omarchy port `22`. Try Omarchy then requests `sshd` for boots that contain a TCP
-mapping to guest port 22. It does not change guest accounts, `sshd_config`,
-password policy, or authorized keys.
+Omarchy port `22`. Try Omarchy then starts `sshd` for boots that contain a TCP
+mapping to guest port 22, and allows port 22 through Omarchy's firewall from
+the Mac's NAT gateway for those boots. It does not change guest accounts,
+`sshd_config`, password policy, or authorized keys.
 
 Connect with the username and password created inside Omarchy (the Mac username
 is not assumed):
@@ -483,13 +479,12 @@ by 1Password. See [setup and authorization boundaries](docs/onepassword-touch-id
 
 ### Touch ID for sudo
 
-Guest clock recovery handles time lost during Mac sleep so fresh signed
-approvals remain usable after wake. Existing VMs need the
-[guest clock recovery installer](docs/guest-clock-recovery.md).
+[Guest clock recovery](docs/guest-clock-recovery.md) handles time lost during
+Mac sleep so fresh signed approvals remain usable after wake.
 
 The native authentication bridge can enroll this Mac and use
 Touch ID as a sufficient authentication method for guest `sudo`. Open
-**Omarchy Menu → Setup → Security → Touch ID for sudo**, or run:
+the **Touch ID for sudo** row in the Omarchy menu, or run:
 
 ```sh
 try-omarchy-touch-id
@@ -509,11 +504,10 @@ enrollment, and unavailable Touch ID all fall back to the normal guest password;
 no login or screen-unlock PAM policy is changed.
 
 If Touch ID falls back, sudo displays the reason before asking for the guest
-password. Signed approvals require synchronized Mac and guest clocks; factory
-images enable `systemd-timesyncd` at boot. On an existing guest with clock drift,
-choose **Update and Launch** to install clock recovery and enable time sync, or
-run `sudo systemctl enable --now systemd-timesyncd.service`, then check
-`timedatectl` for `System clock synchronized: yes` before retrying.
+password. Signed approvals require synchronized Mac and guest clocks. If the
+guest clock drifted, run `sudo systemctl enable --now systemd-timesyncd.service`,
+then check `timedatectl` for `System clock synchronized: yes` before retrying.
+Touch ID has not been verified in the current guest yet.
 
 The Touch ID test refuses guest-password fallback and returns failure if sudo
 cannot authenticate. A passwordless sudo policy can also satisfy this check;
@@ -547,8 +541,7 @@ needed. Reclamation runs asynchronously and covers genuinely free pages, not
 Linux's file cache or memory still held by applications. For example, selecting
 16 GiB and seeing 12 GiB used does not guarantee exactly 4 GiB returned: cache,
 fragmentation, and VM overhead also affect the Mac's memory usage. Keep enough
-headroom for macOS even with reclamation enabled. Updated apps enable this on the
-next VM launch, including for existing VMs; no disk reset is needed.
+headroom for macOS even with reclamation enabled.
 
 Scripted launches can set `OMARCHY_QEMU_GPU_MEMORY_MIB` (a whole number of
 MiB) instead. Scripted launches use the same host-aware default and leave
@@ -559,27 +552,38 @@ accept values between menu steps, down to the guest's 2048 MiB minimum. The
 ## Language
 
 New VMs inherit the Mac's primary language on first boot: English, Traditional
-Chinese (`zh_TW.UTF-8`), or Simplified Chinese (`zh_CN.UTF-8`). Other Mac
-languages currently fall back to English. There is no launcher language setting;
-change the locale inside Omarchy afterward. Later boots and Mac language changes
-do not overwrite that guest choice. Existing VMs keep their saved language.
+Chinese (`zh_TW.UTF-8`), Simplified Chinese (`zh_CN.UTF-8`), Korean
+(`ko_KR.UTF-8`), or Japanese (`ja_JP.UTF-8`). Other Mac languages currently fall
+back to English. There is no launcher language setting; change the locale inside Omarchy afterward. Later
+boots and Mac language changes do not overwrite that guest choice.
 
 Applications use translations where available. Omarchy's own setup wizard and
 menus stay in English: upstream has no translation mechanism for those shell
-scripts. The US keyboard layout remains the default input method; fcitx5 also
-includes Chewing (Bopomofo), reachable with `Ctrl + Space`.
+scripts.
+
+### Japanese, Chinese and Korean input
+
+Omarchy sets up input methods itself. Its first-boot form asks for the keyboard
+and input method (choosing Japanese selects Mozc); change it later with
+**Super+I** or **Setup > Input**. The `try-omarchy` package keeps the Mozc,
+Chewing and Hangul engines and CJK fonts installed, and on a Mac JIS keyboard
+maps **かな** and **英数** to turning the input method on and off. macOS and
+Omarchy select their input methods independently. See
+[Japanese input](docs/japanese-input.md) for details and verification.
 
 ## Requirements
 
 - Apple Silicon Mac (`arm64`)
 - macOS 15 or newer
-- At least 8 GB free initially
+- About 12 GB free for the first launch (the decompressed factory disk is about
+  9 GB), plus room for the VM to grow
 
-On M3 and newer Apple Silicon running macOS 26 or newer, Try Omarchy also
-exposes ARM EL2 to Linux, so the guest provides `/dev/kvm` for nested VMs and
-compatible VMMs. macOS 15 and older Apple Silicon Macs keep the normal
-non-nested launch path. Hardware-accelerated graphics, including Alacritty,
-are available on both macOS 15 and macOS 26.
+Nested virtualization is off by default: with ARM EL2 exposed, the UEFI boot
+currently hangs before Linux starts on M3 and newer Apple Silicon. Scripted
+launches can set `OMARCHY_QEMU_GPU_NESTED_VIRT=1` to try it on macOS 26 or
+newer; when the host supports EL2, the guest then provides `/dev/kvm` for
+nested VMs and compatible VMMs. Hardware-accelerated graphics are available on
+both macOS 15 and macOS 26.
 
 ## Data and updates
 
@@ -612,19 +616,44 @@ not need to reset or delete the VM to update the Mac app.
 ### Existing VM data
 
 Normal launches keep one persistent VM under
-`~/Library/Application Support/Try Omarchy/VM/v1`. Removing or updating the app
-does not remove or replace this data. An existing VM keeps both its writable
-disk and the exact kernel, initramfs, and base command line that were paired
-with that disk. A newer app's bundled factory image is used only to create a
-new VM, after a confirmed **Reset Omarchy**, or for an ephemeral launch.
+`~/Library/Application Support/Try Omarchy/VM/v1`: its disk and UEFI variables
+in `shell/`, and the decompressed factory disk, shared by every new VM, in
+`shell-factory/`. Removing or updating the app does not remove or replace this
+data. The VM boots its own kernel and updates itself. A newer app's factory
+image is downloaded only to create a new VM, after a confirmed **Reset
+Omarchy**, or for an ephemeral launch, and removed once the VM has started.
+
+VMs created by earlier versions of the app, which booted a kernel from the Mac,
+are not launched by this version. Their files (`disks/`, `boot/`) stay in the
+same folder untouched, and the app attaches the old disk to the new VM
+read-only. Omarchy says so once after login; to bring your files over, choose
+**Setup > Import Previous VM** in the Omarchy menu, or run:
+
+```sh
+try-omarchy-import-previous --dry-run   # list what would be copied
+try-omarchy-import-previous             # copy it
+try-omarchy-import-previous --packages  # install the packages you had added
+try-omarchy-import-previous --open      # browse the old disk, --close when done
+```
+
+The import copies every visible file and folder in your old home folder, plus
+SSH and GnuPG keys, Git and GitHub CLI settings, fonts, `pass`, AWS and
+Kubernetes credentials, and never replaces a file that already exists. It
+leaves the old `~/.config` alone, since it was written for an older Omarchy;
+browse it with `--open` and copy what you want by hand. `--packages` installs
+the packages you installed yourself in the old VM; those not in Omarchy's
+repositories (from the AUR, say) are listed for `yay`. When you have
+everything, delete `disks/` and `boot/` from the storage folder to detach the
+old disk and free its space. **Reset Omarchy** leaves them alone.
 Before Reset is enabled, the confirmation sheet requires typing `Try Omarchy`
 exactly; cancelling the sheet returns to the start menu without changing the VM.
 
 ### Guest console log
 
-Each persistent launch writes the guest console to
-`~/Library/Application Support/Try Omarchy/VM/v1/console.log`, and moves the
-previous launch's log aside to `console.log.1` first. This is the record to
+Each persistent launch writes the guest's virtio console to
+`~/Library/Application Support/Try Omarchy/VM/v1/shell/console.log`, and moves
+the previous launch's log aside to `console.log.1` first. The guest adds
+`console=hvc0` to its own kernel command line for this. This is the record to
 read when Omarchy fails to boot, loses its network, or hangs, because a fault
 that forces a reboot is otherwise gone by the time you can look. An ephemeral
 launch keeps its log with the rest of its temporary state and discards it on
@@ -643,151 +672,77 @@ OMARCHY_QEMU_GPU_HVF_TRACE_LOG="$HOME/Desktop/hvf-trace.log" \
 The log holds memory addresses and sizes, no guest data. Attach its last few
 hundred lines with the crash report.
 
-VMs created before paired boot files were introduced are preserved too. On the
-first launch that needs them, Try Omarchy explains the transition in a
-**Continue** / **Cancel** dialog before starting recovery. Continue performs a
-one-time recovery boot: it mounts the saved disk read-only, copies the installed
-kernel and initramfs from `/boot` into private VM storage, validates them, and
-then shuts the recovery boot down. It does not start the saved userspace with
-the newer app's kernel, reset the VM, or upgrade Omarchy. Cancel returns to the
-start menu. Reset is still required when the saved storage or boot format
-itself cannot be safely read.
+### Updating Omarchy
 
-Use Omarchy's built-in updater for the updates it supports inside this ARM
-guest. Ordinary guest packages can advance without replacing the VM, but Try
-Omarchy currently pins its direct-boot kernel and headers, packaged
-`try-omarchy-runtime`, and reviewed compatibility backports in a prioritized
-local repository. Installing a newer Try Omarchy app therefore does not apply
-all of that app's factory-image changes to an existing VM, and an in-guest
-update should not be assumed to reproduce them. A confirmed reset is the
-deliberate, destructive way to start again from the newest bundled factory.
-Reset deletes the saved VM; the next launch prepares its replacement. Launch
-shows image preparation and verification progress when a new disk is needed,
-then startup progress.
+Omarchy updates itself inside the VM: run `omarchy update` or use
+**Update → Omarchy** in the Omarchy menu. It updates Omarchy, Hyprland and the
+kernel, and takes a Snapper snapshot first; the snapshot appears in the boot
+menu so you can roll back. `omarchy-channel-set` switches channels when
+Omarchy publishes another one for ARM. Updating the Mac app does not change
+these.
 
-### Updating integrations in an existing VM
+A confirmed reset is the deliberate, destructive way to start again from the
+newest bundled factory. Reset deletes the saved VM; the next launch prepares
+its replacement.
 
-On the first app open with an existing disk that has no result for the current
-fix bundle, the launcher's bottom button is **Update**. A matching check that
-found unfinished repairs also offers **Update**. Review the fixes and choose **Update and Launch**; the app runs the
-supported repairs before login and retains their results in Settings. Successful
-checks and updates finish without another dialog. No preliminary boot is needed;
-Skip Launcher shows the launcher for that first review. **Skip** requires a
-second confirmation. Each disk and fix bundle shows the automatic review once;
-skipped or failed fixes remain available through the launcher's **Update** action
-after shutting down the VM. They do not interrupt subsequent automatic launches.
-No terminal commands, SSH, or personal folder sharing are
-needed for normal migration.
+### Updating integrations
 
-This covers the supported clipboard/screensaver fixes, Alacritty cleanup,
-power/menu plugins, clock recovery, compatibility holds, missing lock-screen
-password policy, pinch input, integration setup, and eligible Mac battery
-installation/update. Battery builds use the existing kernel and installed tools;
-missing prerequisites are skipped. No packages or kernel are upgraded.
-
-Touch ID pairing and first-time 1Password enablement remain explicit choices.
-Existing custom files and enrolled older authentication protocols are preserved.
-The guest guide remains under **Setup → Try Omarchy Integrations** for opt-in
-setup or manual review. See [integration updates](docs/integration-updates.md)
-for the command inventory, results, and recovery boundaries.
-
-### Repairing update holds in an older guest
-
-Older guests may fail Omarchy Update with conflicting `libaquamarine.so` or
-`libhyprtoolkit.so` dependencies. New factory images hold the compatible
-Hyprland, aquamarine, Hyprtoolkit, and `hyprland-guiutils` packages together,
-along with the direct-boot kernel and headers. Choose **Update and Launch** to repair missing holds automatically without
-changing package versions. The manual repair below remains available for
-diagnostics and custom maintenance.
-
-Copy `guest/scripts/repair-update-holds.py` from this source checkout into the
-guest, then run it **inside Omarchy**, with the updater closed:
-
-```sh
-python3 repair-update-holds.py          # preview only
-sudo python3 repair-update-holds.py --apply
-```
-
-The command adds missing holds to both `/usr/share/try-omarchy/pacman.conf`
-and `/etc/pacman.conf`. The first file is essential: Omarchy's pre-refresh
-hook restores it over the second before updating. Existing holds, comments,
-repository definitions, and unrelated settings are retained in each file.
-Keep any custom settings you want to survive an update in the saved share
-copy too; the existing update hook still replaces the active configuration.
-
-The repair prints a backup directory under
-`/var/lib/try-omarchy/update-holds-backup.*`, preserving both original files
-under their relative paths. To undo it, close the updater and restore each
-backup to its original location with `sudo cp -p`. Running the repair again
-makes no changes when the holds are already present. It refuses to write
-while pacman has a transaction lock.
-
-Then retry **Update → Omarchy**. This command only repairs the hold list; it
-does not install, downgrade, or upgrade packages, and cannot repair packages
-that were already upgraded into an incompatible combination. If dependency
-errors remain, retain the full error output for diagnosis instead of removing
-the kernel or compositor holds.
-
-### Growing an existing VM disk
-
-To add capacity without resetting the VM, shut down Omarchy and run the
-maintenance command from a source checkout on the Mac:
-
-```sh
-# Preview a new total capacity of 32 GiB.
-macos/resize-vm-disk.sh --size-gib 32
-
-# Retain a verified backup, then enlarge the stopped disk.
-macos/resize-vm-disk.sh --size-gib 32 --apply
-```
-
-Run as the macOS user who owns the VM, without `sudo`. The command requires
-Python 3 and an APFS volume, but does not require building the app. It uses the
-same workspace lock as the launcher and refuses an active VM, shrinking,
-unrecognized metadata, or a missing/invalid paired boot kit. An equal size is
-a no-op. Whole-number targets up to 8192 GiB are accepted.
-
-The default state directory is
-`~/Library/Application Support/Try Omarchy/VM/v1`. For a custom VM location,
-pass `--state-root "/path/to/selected-folder/VM/v1"`, using the directory that
-contains `.omarchy-qemu-storage` and `disks/current`. The command does not read
-the app's saved location preference or select legacy development workspaces.
-
-The backup is an APFS clone in a private sibling directory named
-`v1.resize-backup.XXXXXX`; the command prints its exact path. It retains the
-original disk, disk metadata, and paired boot files and verifies the disk's
-checksum before resizing; reading both full disk images can take several
-minutes. Keep it until the resized VM is working. To roll back, shut down the
-VM and restore its original disk from this backup; any
-writes made after the backup would be lost, so preserve the newer disk first.
-Never shrink the enlarged disk to undo the operation.
-
-The host must have free space for the requested increase plus 1 GiB of
-headroom. Growth is sparse, not a reservation of host capacity, and retained
-clones consume additional space as their contents diverge. On the next normal
-boot, the guest's enabled `systemd-growfs-root.service` grows ext4 to fill the
-disk. Verify inside Omarchy with `lsblk` and `df -h /`. No app rebuild, guest
-reinstall, or change to the factory image is needed.
+The Mac integrations inside Omarchy are the `try-omarchy` package. Each app
+release bundles its version and offers it to the VM at every boot; the VM
+installs it before login when it is newer than the installed one. There is
+nothing to approve or run. The start menu's **Omarchy** row shows the guest's
+Omarchy version and channel, and the integration version, after the VM has
+started once. See [integration updates](docs/integration-updates.md).
 
 ### Choosing where the VM lives
 
-**Change…** on the start menu's **VM Location** row moves the VM to any folder
-you pick, including one on an external drive. Omarchy uses exactly the folder
-you choose — it never creates a folder inside it on your behalf.
+Open **Manage…** on the launcher's **Selected VM** row after shutting down
+Omarchy. The dialog shows the selected VM folder and explains what the next
+launch will do:
 
-- The folder must be **empty**, or one Omarchy has already used. A folder with
-  other files in it, or a drive's top level, is turned away with an
-  explanation instead of being restructured; create or pick an empty folder
-  (for example, one named "Try Omarchy") to use instead.
-- The drive must be **APFS**. The VM disk grows as you use it, which only APFS
-  supports here: on exFAT, FAT, or NTFS the same disk would claim its full size
-  the moment it was created. Network volumes are refused because the VM's disk
-  lock is unreliable on them. Anything else is turned away when you pick it, with
-  the actual format named.
-- You need roughly 7 GB free to create the VM, and up to 30 GB as it fills. The
-  disk is sparse, so it only ever occupies what the guest has actually written.
-- **Changing the location does not move your existing VM.** It stays where it
-  is, and switching back reaches it again.
+- **Switch to another VM → Choose Existing VM…** selects a saved VM in another
+  folder. Choose the complete folder containing `shell`.
+  Files stay where they are; this changes which VM the app will launch.
+- **Move the selected VM → Choose Destination…** copies that VM into a completely
+  empty APFS folder, verifies every file, and selects the copy only after
+  success. The decompressed factory copy is not moved; the next launch rebuilds
+  it. The dialog shows copy and verification progress, then the new selected
+  folder and the original recovery-copy path. The original is kept.
+- **Create a separate VM → Choose Empty Folder…** selects an empty folder for a
+  fresh VM, created on the next launch. The previously selected VM is kept.
+- **Delete the selected VM → Delete VM…** shows the exact folder and asks you to
+  type `Try Omarchy` to confirm,
+  then moves the whole VM to macOS Trash. Other VM copies are kept. Recover
+  it from Trash before emptying Trash, or choose another VM or an empty folder
+  to continue. A running VM cannot be deleted.
+- **Use Default Folder** selects
+  `~/Library/Application Support/Try Omarchy/VM/v1` again. If that VM has been
+  deleted, the next launch creates a fresh VM there.
+
+Choices are saved immediately. **Done** returns to the launcher; press
+**Launch** there to start the selected VM. During copying, verification, or deletion,
+**Done** and the other choices are disabled. Errors stay in the dialog. Failed operations keep the selected VM intact.
+
+Moving always acts on the VM selected in the dialog. To move a different saved
+VM, switch to it first. Copies evolve independently after booting; switch
+between them with **Choose Existing VM…**.
+
+For example, create `~/Try Omarchy` in the folder picker to relocate the VM
+into your home directory. Omarchy uses exactly the selected folder. A drive's
+top level and unrelated populated folders are refused.
+
+Both locations must be on local **APFS** drives. Relocation holds the same
+lock as the launcher, refuses an open VM and unsafe links, and never
+replaces files at the destination. Same-volume copies use APFS clones;
+cross-volume copies preserve sparse capacity. Leave enough free space for the
+VM's allocated data plus 1 GiB of headroom. If copying or verification fails,
+the original and the selected boot location stay unchanged. Do not delete the
+original until you have booted and checked the relocated VM. Once you have
+checked your files and settings, you can delete that old workspace, or retain
+it as a recovery copy. For the default location, delete only `VM/v1`, keeping
+the surrounding `Try Omarchy` Application Support folder: it also stores the
+host Touch ID keys used by the relocated VM.
+
 - Do not disconnect the drive while Omarchy is running. macOS refuses a normal
   eject while the VM holds the disk, but pulling the cable can damage it. If the
   volume does disappear, Omarchy shuts the VM down instead of writing on.
@@ -804,11 +759,8 @@ you choose — it never creates a folder inside it on your behalf.
 - `pkg-config` (Homebrew is the simplest way to install it)
 - A running Docker-compatible engine that supports privileged `linux/arm64`
   containers
-- Roughly 20 GB free for guest, runtime, caches, and assembled output
-- Enough memory for the Linux builder as well as macOS. Hyprland compilation
-  automatically limits parallel jobs to the detected memory budget; see the
-  [guest build memory guidance](guest/README.md) for overrides and a measured
-  configuration on a 16 GiB Mac.
+- Roughly 40 GB free for the guest build (a 20 GiB sparse disk image, its
+  compressed copy and the package cache), the runtime, and assembled output
 
 Install the one Homebrew build tool with:
 
@@ -830,12 +782,21 @@ For a first full build and launch:
 make build run
 ```
 
-The first build downloads pinned sources, assembles a multi-gigabyte guest, and
-compiles QEMU, so it can take a while. `make build` includes the basic toolchain
+The first build downloads Omarchy's packages to install the factory disk and
+compiles QEMU from pinned sources, so it can take a while. `make build` includes the basic toolchain
 check. Later builds hash the effective inputs and validate the existing outputs,
-then rebuild only the guest, runtime, or app components that changed. To bypass
-that cache deliberately, run `make build FORCE=1` (or add `FORCE=1` to an
-individual component command).
+then rebuild only the guest package, factory disk, runtime, or app that changed:
+a guest package change rebuilds the package in seconds, not the factory, and
+pinned runtime downloads are kept in `.build/downloads`. To bypass that cache
+deliberately, run `make build FORCE=1` (or add `FORCE=1` to an individual
+component command).
+
+The factory installs whatever Omarchy's edge repositories serve when it is
+built. After each build, `make build` prints whether Omarchy has moved since
+then, with the factory's age and the newer packages; `make refresh` rebuilds
+the factory from the latest Omarchy. `make release` reuses the factory only
+when everything it was built from still matches upstream, and rebuilds it
+otherwise; `make release FORCE=1` always rebuilds it.
 
 Artifacts created before their `.build/state/` record exists are rebuilt once;
 the cache never adopts an output whose successful inputs it did not observe.
@@ -906,7 +867,8 @@ dist/
 ├── release.noindex/
 │   └── Try Omarchy.app     # production identity
 ├── TryOmarchy.dmg         # after make package or make release
-└── guest/                 # verified guest build artifacts
+├── factory/               # the image's release assets, after make package or make release
+└── guest/                 # factory disk, factory.json, packages/
 ```
 
 Both DMG targets create distributable artifacts:
@@ -917,11 +879,13 @@ Both DMG targets create distributable artifacts:
   configured release credentials, and fails instead of producing an
   unnotarized fallback.
 - `make release` offers patch, minor, or major selection and direct version
-  entry, builds guest and runtime artifacts when needed, creates an annotated
+  entry, builds guest, runtime and firmware artifacts when needed, creates an annotated
   local release tag, and performs the same signing and notarization workflow with the
   release-specific credential variables.
   Use `make release VERSION=vX.Y.Z` to choose the version without prompting.
-  GitHub publishing remains manual.
+- `make publish` pushes that tag and attaches the DMG and the factory image
+  parts to its GitHub draft release, creating the draft if needed. Publishing
+  the draft remains manual.
 
 Maintainers should follow [`docs/releasing.md`](docs/releasing.md) for the full build, test, signing, license, corresponding-source, and verification checklist.
 
@@ -931,7 +895,7 @@ Maintainers should follow [`docs/releasing.md`](docs/releasing.md) for the full 
 .
 ├── Makefile                 public build interface
 ├── macos/                   Swift launcher and QEMU/HVF runtime builder
-├── guest/                   reproducible ARM64 factory-image builder
+├── guest/                   try-omarchy guest package and factory-disk builder
 ├── docs/                    architecture and release documentation
 ├── dist/                    generated output (ignored)
 ├── CONTRIBUTING.md

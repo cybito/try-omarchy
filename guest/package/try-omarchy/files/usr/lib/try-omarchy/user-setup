@@ -1,0 +1,73 @@
+#!/bin/bash
+#
+# Per-user Try Omarchy setup. Idempotent; runs as the user at every graphical
+# login (try-omarchy-session.service) and once for the owner right after
+# Omarchy's first-boot provisioning creates the account.
+#
+#   user-setup [--reload]
+#
+# It places one loader in Omarchy's Hyprland toggles directory, which Omarchy
+# loads after the user's own configuration, adds menu rows once and turns
+# Omarchy's idle screensaver and lock off once; a user's later edits stay.
+
+set -euo pipefail
+
+state_home=${XDG_STATE_HOME:-$HOME/.local/state}
+toggles=$state_home/omarchy/toggles/hypr
+loader=$toggles/zz-try-omarchy.lua
+expected='-- Try Omarchy: Mac VM display, cursor and input additions (package-owned).
+pcall(dofile, "/usr/share/try-omarchy/hyprland.lua")'
+
+changed=0
+if [[ ! -f $loader || $(<"$loader") != "$expected" ]]; then
+  mkdir -p "$toggles"
+  printf '%s\n' "$expected" >"$loader.tmp"
+  mv -f "$loader.tmp" "$loader"
+  changed=1
+fi
+
+# Settings and Touch ID rows in the Omarchy menu, added once.
+"${TRY_OMARCHY_MENU_ENTRIES:-/usr/lib/try-omarchy/menu-entries}" || true
+# Omarchy's idle screensaver and lock off in the VM, once.
+"${TRY_OMARCHY_IDLE_DEFAULTS:-/usr/lib/try-omarchy/idle-defaults}" || true
+
+# Extra backgrounds for Omarchy's themes, offered beside the theme's own in
+# its background switcher; the current background is never changed. Each is
+# linked into ~/.config/omarchy/backgrounds/<theme> once, so a user who
+# removes it keeps it removed.
+backgrounds=${TRY_OMARCHY_BACKGROUNDS:-/usr/share/try-omarchy/backgrounds}
+for source in "$backgrounds"/*/*; do
+  [[ -f $source ]] || continue
+  theme=${source%/*}
+  theme=${theme##*/}
+  name=${source##*/}
+  marker=$state_home/try-omarchy/backgrounds/$theme/$name
+  [[ -e $marker ]] && continue
+  target=${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/backgrounds/$theme/$name
+  if [[ ! -e $target && ! -L $target ]]; then
+    mkdir -p "${target%/*}"
+    ln -s "$source" "$target"
+  fi
+  mkdir -p "${marker%/*}"
+  : >"$marker"
+done
+
+if ((changed)) && [[ ${1:-} == --reload && -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]]; then
+  hyprctl reload >/dev/null 2>&1 || true
+fi
+
+# Say once that a VM from an earlier version of the app is attached. The
+# Omarchy shell, which shows notifications, can still be starting at login.
+previous=${TRY_OMARCHY_PREVIOUS_DEVICE:-/dev/disk/by-id/virtio-omarchy-previous}
+marker=$state_home/try-omarchy/previous-vm-announced
+if [[ -b $previous && ! -e $marker ]]; then
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if timeout 5 notify-send "Your previous Try Omarchy VM is attached" \
+      "Copy its files with Setup > Import Previous VM, or run try-omarchy-import-previous." 2>/dev/null; then
+      mkdir -p "${marker%/*}"
+      : >"$marker"
+      break
+    fi
+    sleep 1
+  done
+fi

@@ -1,8 +1,8 @@
 # Contributing
 
 Thanks for helping improve Try Omarchy. The project has one product target: a
-native Apple Silicon macOS app that runs pinned upstream Omarchy in a
-project-built ARM64 virtual machine image.
+native Apple Silicon macOS app that runs stock upstream Omarchy for `aarch64`
+in a virtual machine, with the Mac integrations in one guest package.
 
 ## Pull requests
 
@@ -40,12 +40,13 @@ issues. Coding agents should also read [AGENTS.md](AGENTS.md).
 
 ## Build inputs and local state
 
-The guest and QEMU supply chains are deliberately pinned. Do not update a URL,
-commit, package lock, archive, or checksum independently of its associated
-validation code.
+The QEMU supply chain and the builder's keys are deliberately pinned. Do not
+update a URL, commit, archive, or checksum independently of its associated
+validation code. The factory installs from Omarchy's live repositories; its
+`dist/guest/factory.json` records the database digest it resolved against.
 
-Generated files in `dist/` and build caches in `macos/.build/` and
-`guest/.work/` are not committed. Use `make clean` to remove project build
+Generated files in `dist/` and build caches in `macos/.build/` are not
+committed. Use `make clean` to remove project build
 artifacts and caches. `make clean-all` additionally destroys persistent local
 VM data and should only be used when a complete reset is intended.
 
@@ -54,29 +55,24 @@ published only after the build succeeds and its output passes validation. Use
 `FORCE=1` when reviewing reproducibility or when an intentionally unchanged
 input must be rebuilt; do not work around the cache by editing generated state.
 
-## Updating Omarchy
+## Updating Omarchy and the guest package
 
-Pin an official upstream release, refresh the complete ARM64 transaction lock,
-and verify the source contract with one command:
+The guest updates itself with `omarchy update`, so there is no Omarchy pin to
+move. The factory is cached by its own inputs, not by upstream: after each
+`make build` a check compares Omarchy's edge index with the one the factory
+was built from and says how old the factory is and which installed packages
+are newer upstream. `make refresh` rebuilds the factory from the latest
+Omarchy, then builds. `make release` rebuilds it unless every repository and
+the Node.js release it was built from still match upstream (`FORCE=1` always
+rebuilds). Review
+`dist/guest/factory.json` and `dist/guest/packages.txt` afterwards.
 
-```sh
-make update-omarchy OMARCHY_RELEASE=4.0.4
-```
-
-The command keeps a complete shallow source checkout under `.build/upstream/`,
-verifies that its clean `HEAD` is the requested release tag, and derives the
-commit, Git tree, normalized source digest, source timestamp, source-reported
-version, and official release version. It then refreshes the package lock and
-runs the guest contract against that exact checkout.
-
-Before committing an update, review the upstream diff—especially changes to
-`install/omarchy-base.packages`—against the intentionally trimmed
-`guest/packages.txt`. Add runtime dependencies the native guest now needs, then
-review every entry in `authenticity.backports`: drop a backport that the new
-release contains, or refresh its strict preimage and postimage hashes after
-review. Run `make guest` and `make test`. The upstream source can report a development
-version even for an official tag, so never hand-edit the `version` or `release`
-fields to make them agree; they record different upstream identities.
+Mac integrations in the guest live in the `try-omarchy` package
+([guest/package](guest/package/README.md)). Bump its `pkgrel` (or `pkgver`)
+whenever its contents change, so existing VMs take the new package at their
+next boot; the guest installs the app's package only when it is newer. Keep
+host-guest protocols compatible in both directions: a newer app must work with
+an older package, and the reverse. Run `make guest-package` and `make test`.
 
 ## Tests
 
@@ -84,12 +80,47 @@ fields to make them agree; they record different upstream identities.
 The Swift build and tests finish before any shell suite uses the native helper.
 Use `make test TEST_JOBS=1` for serial output when debugging, or set `TEST_JOBS`
 to another positive integer to bound concurrency. Individual groups are available
-as `make test-contracts`, `make test-guest`, `make test-swift`, and
-`make test-shell`; `make test-resize` runs the disk resize integration tests.
+as `make test-contracts`, `make test-guest` (the guest package), `make test-swift`,
+and `make test-shell`.
 
 PR checks run all tests and full runtime builds in separate, concurrent jobs on
-both macOS 15 and 26, labeled `Tests` and `Build`. No suites or runtime checks
-are skipped based on changed paths or cached test results.
+both macOS 15 and 26, labeled `Tests` and `Build`. Beside them, three Linux
+arm64 jobs check the guest the way a user meets it:
+
+- `Guest contracts` runs `make test-guest` on GNU tools, the guest scripts
+  through ShellCheck, and `make test-upstream`, which checks the package's menu
+  rows, commands, unit drop-ins and paths against the Omarchy the factory
+  installs today.
+- `Guest package install` installs the package with its dependencies from
+  Omarchy's live repositories, builds its DKMS modules, upgrades from the base
+  revision's package (whose version must be lower when the package changed)
+  and removes it (`make test-guest-install`).
+- `Guest desktop` boots the factory's userland with systemd-nspawn, offers the
+  change's package the way the app offers its bundled one, and checks
+  first-boot setup, the system and package units, Omarchy's desktop session on
+  a vkms virtual display, its keybindings, the browser, screen recording, a
+  theme switch, the factory's apps, and Ghostty, Kitty and 1Password installed
+  the way Omarchy's Install menu does
+  ([guest/tests/desktop/run.sh](guest/tests/desktop/run.sh)). It boots the
+  nightly factory unless the change touches the factory's own inputs, which
+  then build here. Screenshots and logs are kept with the run.
+
+No suites or runtime checks are skipped based on changed paths or cached test
+results; the builder image, package downloads and the nightly factory are
+cached.
+
+Outside pull requests:
+
+- **Guest desktop** (nightly, or by hand from the Actions tab) builds a new
+  factory from Omarchy's live repositories and runs the same checks with VS
+  Code and Signal added. Its factory is the one pull requests boot the next
+  day.
+- **`make e2e`** (on an Apple Silicon Mac, with Docker running) boots a
+  disposable VM in the built app's own runtime and adds what only a Mac has:
+  HVF, VirGL on the Mac's GPU, Omarchy's keybindings on the VM's keyboard, the
+  bridges, the shared folder, shutdown and a second boot ([tests/e2e/run.sh](tests/e2e/run.sh)). Run it before opening a
+  pull request that changes the app, the runtime, the launcher or the bridges
+  (the template's checklist asks), and before a release.
 
 Tests should describe a user-visible behavior, policy, data contract, or
 process boundary. Keep presentation and edit rules in deterministic models that

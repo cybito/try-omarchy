@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
+import plistlib
 import re
 import subprocess
 import sys
@@ -99,6 +101,60 @@ def validate_tag(root: Path, tag: str, head: str) -> bool:
     return False
 
 
+def verify_release_artifacts(root: Path, tag: str) -> None:
+    app = root / "dist/release.noindex/Try Omarchy.app"
+    try:
+        info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
+    except (OSError, plistlib.InvalidFileException, ValueError) as error:
+        raise ValueError(f"could not verify built app version: {error}") from error
+
+    version = tag.removeprefix("v")
+    if (info.get("CFBundleShortVersionString") != version
+            or info.get("TryOmarchyBuildDescribe") != tag):
+        raise ValueError(f"built app version does not match {tag}")
+
+    dmg = root / "dist" / "TryOmarchy.dmg"
+    if not dmg.is_file():
+        raise ValueError(f"release DMG was not produced: {dmg}")
+
+    # The app downloads its factory from this release's assets.
+    try:
+        manifest = json.loads((app / "Contents/Resources/guest/download.json").read_text())
+        parts = manifest["parts"]
+    except (OSError, ValueError, KeyError) as error:
+        raise ValueError(f"the app has no factory download manifest: {error}") from error
+    prefix = f"https://github.com/omacom/try-omarchy/releases/download/{tag}/"
+    for part in parts:
+        name = part["url"].removeprefix(prefix)
+        if name == part["url"] or "/" in name:
+            raise ValueError(f"the factory download does not point at {tag}: {part['url']}")
+        asset = root / "dist/factory" / name
+        if not asset.is_file() or asset.stat().st_size != part["bytes"]:
+            raise ValueError(f"factory release asset is missing: {asset}")
+
+
+def release_assets(root: Path) -> list[Path]:
+    return [root / "dist/TryOmarchy.dmg", *sorted((root / "dist/factory").glob("*"))]
+
+
+def prepare_factory(root: Path, make: str, force: bool) -> None:
+    """A release ships a factory built from what upstream serves now. The
+    cached one is reused only when every repository and the Node.js release
+    it was built from still match; otherwise, or with FORCE=1, it is rebuilt."""
+    guest = [make, "--no-print-directory", "-C", str(root), "guest"]
+    if force:
+        print("[factory] FORCE=1: rebuilding the factory from the latest upstream", flush=True)
+        subprocess.run([*guest, "FORCE=1"], check=True)
+        return
+    # Rebuilds only if the factory's own inputs changed.
+    subprocess.run([*guest, "FORCE=0"], check=True)
+    current = subprocess.run(
+        [sys.executable, str(root / "scripts/factory-freshness.py"), "--root", str(root), "--check"])
+    if current.returncode != 0:
+        print("[factory] Rebuilding the factory from the latest upstream", flush=True)
+        subprocess.run([*guest, "FORCE=1"], check=True)
+
+
 def release(root: Path, make: str) -> None:
     identity = os.environ.get("RELEASE_SIGN_IDENTITY", "")
     profile = os.environ.get("RELEASE_NOTARY_PROFILE", "")
@@ -117,7 +173,9 @@ def release(root: Path, make: str) -> None:
             raise ValueError("release cancelled; no builds or tag changes were made")
     clean_head(root, head)
     print(f"Preparing {tag} from {head[:12]}", flush=True)
-    subprocess.run([make, "--no-print-directory", "-C", str(root), "guest", "runtime"], check=True)
+    prepare_factory(root, make, force=os.environ.get("RELEASE_FORCE") == "1")
+    # The runtime is pinned by checksum: FORCE=1 would rebuild the same QEMU.
+    subprocess.run([make, "--no-print-directory", "-C", str(root), "runtime", "FORCE=0"], check=True)
     clean_head(root, head)
     if validate_tag(root, tag, head):
         print(f"Reusing {tag}", flush=True)
@@ -133,13 +191,14 @@ def release(root: Path, make: str) -> None:
             "--guest-dir", str(root / "dist/guest"),
             "--sign-identity", identity, "--notarize-profile", profile,
         ], cwd=root, check=True)
+        verify_release_artifacts(root, tag)
         clean_head(root, head)
     except (ValueError, OSError, subprocess.CalledProcessError, KeyboardInterrupt):
         print(f"Local tag {tag} remains. Retry with make release VERSION={tag}", file=sys.stderr)
         raise
     print(f"Release DMG: {root / 'dist' / 'TryOmarchy.dmg'}", flush=True)
-    print(f"After verifying it, push the tag: git push origin {tag}", flush=True)
-    print("Then create the GitHub release and upload the DMG.", flush=True)
+    print("After verifying it, run make publish to push the tag and attach the DMG and", flush=True)
+    print(f"factory image parts to the {tag} draft release.", flush=True)
 
 
 def main() -> None:

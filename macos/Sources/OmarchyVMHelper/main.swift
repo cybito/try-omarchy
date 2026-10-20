@@ -5,7 +5,7 @@ import Foundation
 private var terminationSignalSources: [DispatchSourceSignal] = []
 
 private func usage() -> Never {
-    fputs("Usage: omarchy-vm-helper --run-qemu [--ephemeral | --reset-storage | --reset-storage-only] [GUEST_DIR] | --host-keyboard-geometry | --host-timezone | --host-audio-frequency output|input [SDL_NAME] | --wait-for-qmp QEMU_PID SOCKET | --bridge-command-super QEMU_PID QMP_SOCKET | --bridge-native-audio QEMU_PID SOCKET ROUTE_DIRECTORY | --bridge-native-authentication QEMU_PID SOCKET | --bridge-native-camera QEMU_PID SOCKET | --bridge-native-battery QEMU_PID SOCKET | --bridge-native-clipboard QEMU_PID SOCKET | --bridge-native-timezone QEMU_PID SOCKET\n", stderr)
+    fputs("Usage: omarchy-vm-helper --run-qemu [--ephemeral | --reset-storage | --reset-storage-only] [GUEST_DIR] | --copy-vm SOURCE EMPTY_DESTINATION | --trash-vm SOURCE CONFIRMED_IDENTITY | --host-keyboard-geometry | --host-display-cutouts | --host-timezone | --host-audio-frequency output|input [SDL_NAME] | --wait-for-qmp QEMU_PID SOCKET | --sparsify DISK | --bridge-guest-status QEMU_PID SOCKET STATUS_FILE | --bridge-command-super QEMU_PID QMP_SOCKET | --bridge-native-audio QEMU_PID SOCKET ROUTE_DIRECTORY | --bridge-native-authentication QEMU_PID SOCKET | --bridge-native-camera QEMU_PID SOCKET | --bridge-native-battery QEMU_PID SOCKET | --bridge-native-clipboard QEMU_PID SOCKET | --bridge-native-timezone QEMU_PID SOCKET\n", stderr)
     exit(64)
 }
 
@@ -34,19 +34,22 @@ do {
         try bridge.run()
         exit(0)
     }
-    if arguments.first == "--storage-sha256" {
-        guard arguments.count == 2 else { usage() }
-        print(try StorageIO.sha256(path: arguments[1]))
+    if arguments.first == "--copy-vm" {
+        guard arguments.count == 3 else { usage() }
+        var previousPhase: VMTransferProgress.Phase?
+        var lastEmission: TimeInterval = 0
+        print(try VMWorkspaceTransfer.copy(from: arguments[1], to: arguments[2], progress: { update in
+            let now = ProcessInfo.processInfo.systemUptime
+            guard update.phase != previousPhase || now - lastEmission >= 0.2 || update.fraction == 1 else { return }
+            previousPhase = update.phase
+            lastEmission = now
+            FileHandle.standardError.write(Data(update.line.utf8))
+        }))
         exit(0)
     }
-    if arguments.first == "--storage-sync" {
-        guard arguments.count > 1 else { usage() }
-        try StorageIO.sync(paths: Array(arguments.dropFirst()))
-        exit(0)
-    }
-    if arguments.first == "--grow-vm-disk" {
-        guard arguments.count == 5, let old = Int64(arguments[2]), let target = Int64(arguments[3]) else { usage() }
-        try SparseDiskGrowth.grow(path: arguments[1], expectedBytes: old, targetBytes: target, identity: arguments[4])
+    if arguments.first == "--trash-vm" {
+        guard arguments.count == 3 else { usage() }
+        try VMWorkspaceTransfer.trash(arguments[1], expectedIdentity: arguments[2])
         exit(0)
     }
     if arguments.first == "--wait-for-qmp" {
@@ -87,13 +90,15 @@ do {
         }
         dispatchMain()
     }
-    if arguments.first == "--bridge-integrations" {
+    if arguments.first == "--sparsify" {
+        guard arguments.count == 2 else { usage() }
+        let punched = try SparseDiskZeroRanges.punch(path: arguments[1])
+        print(punched)
+        exit(0)
+    }
+    if arguments.first == "--bridge-guest-status" {
         guard arguments.count == 4, let pid = Int32(arguments[1]), pid > 1 else { usage() }
-        NSApplication.shared.setActivationPolicy(.accessory)
-        try MainActor.assumeIsolated {
-            let bridge = try GuestIntegrationBridge(targetPID: pid, socketPath: arguments[2], cachePath: arguments[3])
-            bridge.run()
-        }
+        try ShellGuestStatusBridge.run(targetPID: pid, socketPath: arguments[2], statusPath: arguments[3])
         exit(0)
     }
 
@@ -248,6 +253,12 @@ do {
             direction: direction, selectedSDLName: selectedName
         ) else { exit(1) }
         print(rate)
+        exit(0)
+    }
+
+    if arguments.first == "--host-display-cutouts" {
+        guard arguments.count == 1 else { usage() }
+        print(MainActor.assumeIsolated { HostDisplayCutouts.detect() })
         exit(0)
     }
 

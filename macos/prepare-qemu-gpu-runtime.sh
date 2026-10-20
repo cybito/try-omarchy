@@ -168,6 +168,10 @@ download_and_verify() {
   local output=$4
   local actual_sha
 
+  if pinned_download_from_cache "$expected_sha" "$output"; then
+    log "Using the downloaded $label"
+    return
+  fi
   log "Downloading $label"
   curl --fail --location --silent --show-error \
     --proto '=https' --proto-redir '=https' --tlsv1.2 \
@@ -176,6 +180,7 @@ download_and_verify() {
   actual_sha=$(pinned_bottle_sha256 "$output") || die "could not hash $label"
   [[ $actual_sha == "$expected_sha" ]] || \
     die "$label checksum mismatch: expected $expected_sha, got $actual_sha"
+  pinned_download_to_cache "$output"
 }
 
 obtain_and_verify() {
@@ -407,7 +412,8 @@ verify_runtime_tree() {
     die "relocated QEMU is missing the ARM virt machine"
   virt_help=$("$qemu" -machine virt,help 2>&1) || \
     die "relocated QEMU could not inspect the ARM virt machine: $virt_help"
-  printf '%s\n' "$virt_help" | grep -Fq 'virtualization=<bool>' || \
+  # grep -q can close the pipe before printf finishes and fail under pipefail.
+  [[ $virt_help == *'virtualization=<bool>'* ]] || \
     die "relocated QEMU is missing the ARM virtualization-extension switch"
 
   cpu_help=$("$qemu" -cpu help 2>&1) || \

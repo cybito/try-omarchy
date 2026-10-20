@@ -27,11 +27,35 @@ build_cache = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(build_cache)
 
 
-FAKE_GUEST_BUILDER = textwrap.dedent(
+FAKE_FACTORY = textwrap.dedent(
     r"""
     import hashlib
     import json
     from pathlib import Path
+
+
+    def write_fake_factory(output, label):
+        output.mkdir(parents=True, exist_ok=True)
+        disk = f"disk {label}\n".encode()
+        (output / "omarchy-aarch64-edge.img.zst").write_bytes(disk)
+        factory = {
+            "format": 1, "kind": "upstream-shell-factory", "boot": "uefi-limine",
+            "compressed": {"path": "omarchy-aarch64-edge.img.zst", "sha256": hashlib.sha256(disk).hexdigest()},
+        }
+        (output / "factory.json").write_text(json.dumps(factory) + "\n")
+        (output / "packages.txt").write_text(f"omarchy {label}\n")
+        (output / "unavailable.txt").write_text("")
+        names = ["factory.json", "omarchy-aarch64-edge.img.zst", "packages.txt", "unavailable.txt"]
+        (output / "SHA256SUMS").write_text("".join(
+            f"{hashlib.sha256((output / name).read_bytes()).hexdigest()}  {name}\n" for name in names
+        ))
+        (output / "packages").mkdir(exist_ok=True)
+        (output / "packages/try-omarchy-0.1.0-1-aarch64.pkg.tar.zst").write_text(label)
+    """
+)
+
+FAKE_GUEST_BUILDER = FAKE_FACTORY + textwrap.dedent(
+    r"""
     import sys
     import time
 
@@ -47,50 +71,20 @@ FAKE_GUEST_BUILDER = textwrap.dedent(
     if mode == "mutate":
         (root / "guest/build.input").write_text("changed during build\n")
 
-    output = root / "dist/guest"
-    output.mkdir(parents=True, exist_ok=True)
-    artifacts = {
-        "LICENSE.omarchy",
-        "build-spec.json",
-        "initramfs-linux.img",
-        "packages.lock.txt",
-        "provenance.json",
-        "rootfs.ext4",
-        "rootfs.ext4.zst",
-        "vmlinuz-linux",
-    }
-    spec = (root / "guest/spec.json").read_bytes()
-    records = []
-    checksums = {}
-    for name in sorted(artifacts):
-        contents = spec if name == "build-spec.json" else f"{name} build {count}\n".encode()
-        (output / name).write_bytes(contents)
-        digest = hashlib.sha256(contents).hexdigest()
-        checksums[name] = digest
-        records.append({"path": name, "bytes": len(contents), "sha256": digest})
-    manifest = {
-        "schemaVersion": 1,
-        "kind": "try-omarchy-guest-artifacts",
-        "artifacts": records,
-    }
-    manifest_bytes = (json.dumps(manifest, sort_keys=True) + "\n").encode()
-    (output / "guest-manifest.json").write_bytes(manifest_bytes)
-    checksums["guest-manifest.json"] = hashlib.sha256(manifest_bytes).hexdigest()
-    (output / "SHA256SUMS").write_text(
-        "".join(f"{digest}  {name}\n" for name, digest in sorted(checksums.items()))
-    )
+    write_fake_factory(root / "dist/guest", f"build {count}")
     """
 )
 
 
 class BuildCacheTests(unittest.TestCase):
-    def test_app_fingerprint_tracks_migration_catalog_and_reviewed_inputs(self) -> None:
+    def test_app_fingerprint_tracks_the_bundled_package_and_firmware(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            migrations = root / "guest/migrations"
-            migrations.mkdir(parents=True)
-            for name in ("catalog.json", "preimages.json"):
-                (migrations / name).write_text("initial\n")
+            package = root / "dist/guest/packages/try-omarchy-0.1.0-1-aarch64.pkg.tar.zst"
+            firmware = root / "macos/.build/firmware/edk2-aarch64-code.fd"
+            for path in (package, firmware):
+                path.parent.mkdir(parents=True)
+                path.write_text("initial\n")
             for path in build_cache.component_files(root, "app"):
                 if not path.exists():
                     path.parent.mkdir(parents=True, exist_ok=True)
@@ -99,31 +93,10 @@ class BuildCacheTests(unittest.TestCase):
                     patch.object(build_cache, "build_version", return_value={}), \
                     patch.object(build_cache, "app_external_files", return_value=[]):
                 previous = build_cache.fingerprint(root, "app", ["build-app"])
-                for name in ("catalog.json", "preimages.json"):
-                    (migrations / name).write_text("updated\n")
+                for path in (package, firmware):
+                    path.write_text("updated\n")
                     current = build_cache.fingerprint(root, "app", ["build-app"])
-                    self.assertNotEqual(previous, current, name)
-                    previous = current
-
-    def test_app_fingerprint_tracks_bundled_battery_module_sources(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            module = root / "guest/native-module/try-omarchy-battery"
-            module.mkdir(parents=True)
-            for name in ("try-omarchy-battery.c", "Makefile", "dkms.conf"):
-                (module / name).write_text("initial\n")
-            for path in build_cache.component_files(root, "app"):
-                if not path.exists():
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    path.write_text("fixture\n")
-            with patch.object(build_cache, "context", return_value={}), \
-                    patch.object(build_cache, "build_version", return_value={}), \
-                    patch.object(build_cache, "app_external_files", return_value=[]):
-                previous = build_cache.fingerprint(root, "app", ["build-app"])
-                for name in ("try-omarchy-battery.c", "Makefile", "dkms.conf"):
-                    (module / name).write_text("updated\n")
-                    current = build_cache.fingerprint(root, "app", ["build-app"])
-                    self.assertNotEqual(previous, current, name)
+                    self.assertNotEqual(previous, current, path.name)
                     previous = current
 
     def test_runtime_fingerprint_tracks_compiled_graphics_regressions(self) -> None:
@@ -145,8 +118,8 @@ class BuildCacheTests(unittest.TestCase):
     @staticmethod
     def prepare_fake_guest(root: Path) -> None:
         (root / "guest").mkdir()
-        (root / "guest/spec.json").write_text('{"schemaVersion": 1}\n')
         (root / "guest/build.input").write_text("initial\n")
+        (root / "LICENSE").write_text("license\n")
 
     def test_make_orders_components_and_propagates_force(self) -> None:
         dry_run = subprocess.run(
@@ -157,9 +130,13 @@ class BuildCacheTests(unittest.TestCase):
             stderr=subprocess.STDOUT,
             text=True,
         ).stdout
+        package = dry_run.index(" guest-package --")
         guest = dry_run.index(" guest --")
         runtime = dry_run.index(" runtime --")
         app = dry_run.index(" app --")
+        self.assertLess(package, guest)
+        self.assertIn("--factory-only", dry_run[guest:runtime])
+        self.assertIn('OMARCHY_DOWNLOAD_CACHE="' + str(REPOSITORY / ".build/downloads") + '"', dry_run)
         self.assertLess(guest, runtime)
         self.assertLess(runtime, app)
         self.assertIn("Build output:", dry_run)
@@ -175,7 +152,8 @@ class BuildCacheTests(unittest.TestCase):
             stderr=subprocess.STDOUT,
             text=True,
         ).stdout
-        self.assertEqual(3, forced.count('OMARCHY_FORCE_BUILD="1"'))
+        self.assertEqual(4, forced.count('OMARCHY_FORCE_BUILD="1"'))
+        self.assertIn("stage-uefi-firmware.sh", forced)
 
         invalid_release = subprocess.run(
             ["make", "release", "RELEASE_SIGN_IDENTITY=invalid"],
@@ -232,12 +210,13 @@ class BuildCacheTests(unittest.TestCase):
     def test_guest_fingerprint_tracks_build_inputs_but_not_documentation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            (root / "guest/tests").mkdir(parents=True)
-            (root / "guest/scripts/__pycache__").mkdir(parents=True)
+            (root / "guest/package/tests").mkdir(parents=True)
+            (root / "guest/package/__pycache__").mkdir(parents=True)
             (root / "guest/build.sh").write_text("one\n")
-            (root / "guest/README.md").write_text("first docs\n")
-            (root / "guest/tests/example.py").write_text("first test\n")
-            bytecode = root / "guest/scripts/__pycache__/helper.pyc"
+            (root / "LICENSE").write_text("license\n")
+            (root / "guest/package/README.md").write_text("first docs\n")
+            (root / "guest/package/tests/example.py").write_text("first test\n")
+            bytecode = root / "guest/package/__pycache__/helper.pyc"
             bytecode.write_bytes(b"first transient bytecode\n")
             command = [
                 str(root / "guest/build.sh"),
@@ -246,8 +225,8 @@ class BuildCacheTests(unittest.TestCase):
             ]
 
             original = build_cache.fingerprint(root, "guest", command)
-            (root / "guest/README.md").write_text("second docs\n")
-            (root / "guest/tests/example.py").write_text("second test\n")
+            (root / "guest/package/README.md").write_text("second docs\n")
+            (root / "guest/package/tests/example.py").write_text("second test\n")
             bytecode.write_bytes(b"second transient bytecode\n")
             self.assertEqual(original, build_cache.fingerprint(root, "guest", command))
 
@@ -256,53 +235,102 @@ class BuildCacheTests(unittest.TestCase):
                 original, build_cache.fingerprint(root, "guest", command)
             )
 
+    def test_a_package_change_rebuilds_the_package_not_the_factory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            recipe = root / "guest/package/try-omarchy/PKGBUILD"
+            script = root / "guest/package/try-omarchy/files/usr/lib/try-omarchy/menu-entries"
+            console = root / "guest/package/try-omarchy/files/etc/limine-entry-tool.d/50-console.conf"
+            for path in (recipe, script, console, root / "guest/factory/build-image.sh"):
+                path.parent.mkdir(parents=True, exist_ok=True)
+            recipe.write_text("pkgrel=1\ndepends=(\n  'bash'\n)\noptdepends=(\n  'wf-recorder: x'\n)\n")
+            script.write_text("one\n")
+            console.write_text("console=hvc0\n")
+            (root / "guest/factory/build-image.sh").write_text("factory\n")
+            (root / "LICENSE").write_text("license\n")
+            factory = [str(root / "guest/build.sh"), "--factory-only"]
+            package = [str(root / "guest/package/build.sh")]
+            factory_before = build_cache.fingerprint(root, "guest", factory)
+            package_before = build_cache.fingerprint(root, "guest-package", package)
+
+            # Package contents and a release bump reach VMs through the app.
+            script.write_text("two\n")
+            recipe.write_text(recipe.read_text().replace("pkgrel=1", "pkgrel=2"))
+            self.assertEqual(factory_before, build_cache.fingerprint(root, "guest", factory))
+            self.assertNotEqual(package_before, build_cache.fingerprint(root, "guest-package", package))
+
+            # What the factory bakes in: the boot image's command line and
+            # the dependencies it installs.
+            console.write_text("console=hvc0 quiet\n")
+            after_console = build_cache.fingerprint(root, "guest", factory)
+            self.assertNotEqual(factory_before, after_console)
+            recipe.write_text(recipe.read_text().replace("'wf-recorder: x'", "'wf-recorder: x'\n  'mpv: y'"))
+            self.assertNotEqual(after_console, build_cache.fingerprint(root, "guest", factory))
+
+    def test_pinned_downloads_are_kept_and_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary)
+            archive = work / "fresh/qemu-1.tar.gz"
+            archive.parent.mkdir()
+            archive.write_bytes(b"pinned archive\n")
+            pin = hashlib.sha256(b"pinned archive\n").hexdigest()
+            script = f"""
+                set -euo pipefail
+                log() {{ :; }}; die() {{ echo "$*" >&2; exit 1; }}
+                source "{REPOSITORY / 'macos/pinned-runtime-bottles.sh'}"
+                pinned_download_to_cache "{archive}"
+                mkdir -p "{work}/out"
+                pinned_download_from_cache {pin} "{work}/out/qemu-1.tar.gz" && echo hit
+                pinned_download_from_cache {'0' * 64} "{work}/out/other.tar.gz" || echo "wrong pin misses"
+            """
+            result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True,
+                                    env={**os.environ, "OMARCHY_DOWNLOAD_CACHE": str(work / "cache")})
+            self.assertEqual(result.stdout.split("\n")[:2], ["hit", "wrong pin misses"])
+            self.assertEqual((work / "cache/qemu-1.tar.gz").read_bytes(), b"pinned archive\n")
+            # A corrupted cache entry is never used.
+            (work / "cache/qemu-1.tar.gz").write_bytes(b"tampered\n")
+            missed = subprocess.run(["bash", "-c", script.replace("pinned_download_to_cache", ": ")],
+                                    capture_output=True, text=True, check=True,
+                                    env={**os.environ, "OMARCHY_DOWNLOAD_CACHE": str(work / "cache")})
+            self.assertNotIn("hit", missed.stdout)
+
     def test_guest_validation_checks_manifest_and_successful_output_snapshot(
         self,
     ) -> None:
+        namespace: dict[str, object] = {}
+        exec(FAKE_FACTORY, namespace)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             output = root / "dist/guest"
-            output.mkdir(parents=True)
-            (root / "guest").mkdir()
-            spec_contents = b'{"schemaVersion": 1}\n'
-            (root / "guest/spec.json").write_bytes(spec_contents)
-
-            records = []
-            checksums: dict[str, str] = {}
-            for name in sorted(build_cache.GUEST_ARTIFACTS):
-                contents = (
-                    spec_contents if name == "build-spec.json" else f"{name}\n".encode()
-                )
-                (output / name).write_bytes(contents)
-                digest = hashlib.sha256(contents).hexdigest()
-                checksums[name] = digest
-                records.append({"path": name, "bytes": len(contents), "sha256": digest})
-            manifest = {
-                "schemaVersion": 1,
-                "kind": "try-omarchy-guest-artifacts",
-                "artifacts": records,
-            }
-            manifest_bytes = (json.dumps(manifest, sort_keys=True) + "\n").encode()
-            (output / "guest-manifest.json").write_bytes(manifest_bytes)
-            checksums["guest-manifest.json"] = hashlib.sha256(
-                manifest_bytes
-            ).hexdigest()
-            (output / "SHA256SUMS").write_text(
-                "".join(
-                    f"{digest}  {name}\n" for name, digest in sorted(checksums.items())
-                )
-            )
+            namespace["write_fake_factory"](output, "one")
 
             snapshot = build_cache.validate_guest(root, None)
             self.assertEqual(
                 snapshot, build_cache.validate_guest(root, {"outputs": snapshot})
             )
 
-            artifact = output / "rootfs.ext4.zst"
+            # Rebuilding only the package keeps the factory current.
+            package = next((output / "packages").iterdir())
+            package.write_text("rebuilt package")
+            self.assertEqual(snapshot, build_cache.validate_guest(root, {"outputs": snapshot}))
+
+            artifact = output / "omarchy-aarch64-edge.img.zst"
             metadata = artifact.stat()
             os.utime(artifact, ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1))
             with self.assertRaisesRegex(build_cache.CacheError, "metadata changed"):
                 build_cache.validate_guest(root, {"outputs": snapshot})
+
+            artifact.write_bytes(b"other disk\n")
+            with self.assertRaisesRegex(build_cache.CacheError, "SHA256SUMS|checksum"):
+                namespace_sums = (output / "SHA256SUMS").read_text()
+                (output / "SHA256SUMS").write_text(namespace_sums.replace(
+                    namespace_sums.split()[2], "0" * 64, 1))
+                build_cache.validate_guest(root, None)
+
+            namespace["write_fake_factory"](output, "two")
+            (package.parent / "try-omarchy-0.1.0-2-aarch64.pkg.tar.zst").write_text("second")
+            with self.assertRaisesRegex(build_cache.CacheError, "exactly one try-omarchy package"):
+                build_cache.validate_guest(root, None)
 
     def test_app_validation_requires_packaged_icon(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -311,8 +339,9 @@ class BuildCacheTests(unittest.TestCase):
             for relative in (
                 "Contents/MacOS/omarchy-vm-helper",
                 "Contents/Resources/runtime/bin/Try Omarchy",
-                "Contents/Resources/guest/rootfs.ext4.zst",
-                "Contents/Resources/guest/launch.plist",
+                "Contents/Resources/guest/factory.json",
+                "Contents/Resources/guest/omarchy-aarch64-edge.img.zst",
+                "Contents/Resources/firmware/edk2-aarch64-code.fd",
             ):
                 path = app / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -328,13 +357,8 @@ class BuildCacheTests(unittest.TestCase):
             root = Path(temporary)
             for relative in (
                 "macos/Info.plist", "LICENSE", ".build/state/guest.json",
-                ".build/state/runtime.json", "dist/guest/guest-manifest.json",
+                ".build/state/runtime.json", "dist/guest/factory.json",
                 "dist/guest/SHA256SUMS",
-                "guest/scripts/install-settings-integration.py",
-                "guest/native-overlay/usr/local/bin/omarchy-native-settings",
-                "guest/native-overlay/etc/udev/rules.d/92-omarchy-native-settings.rules",
-                "guest/native-overlay/usr/share/applications/try-omarchy-settings.desktop",
-                "guest/native-overlay/etc/skel/.config/omarchy/extensions/omarchy-menu.jsonc",
                 *(f"macos/.build/qemu-gpu-runtime/{name}" for name in build_cache.RUNTIME_FILES),
             ):
                 path = root / relative
@@ -420,7 +444,7 @@ class BuildCacheTests(unittest.TestCase):
             invoke(force=True)
             self.assertEqual("3", (root / "build-count").read_text().strip())
 
-            with (root / "dist/guest/rootfs.ext4.zst").open("ab") as stream:
+            with (root / "dist/guest/omarchy-aarch64-edge.img.zst").open("ab") as stream:
                 stream.write(b"tampered")
             invoke()
             self.assertEqual("4", (root / "build-count").read_text().strip())

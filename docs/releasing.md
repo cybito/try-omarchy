@@ -49,25 +49,51 @@ unambiguous.
 `make package` remains available for an already-tagged clean checkout. It
 neither prompts nor creates a tag.
 
-After verifying the DMG, push the tag with `git push origin vX.Y.Z`, then create
-the GitHub release manually using that existing tag and attach
-`dist/TryOmarchy.dmg`. The filename stays the same for every release; the app
-inside is stamped with the version from the release tag. `make release` creates
-the local tag; pushing it, creating the GitHub release, and uploading the DMG
-remain manual.
+After verifying the DMG, run:
+
+```sh
+make publish
+```
+
+It reads the version from the built app, checks that the DMG exists and that
+the app's download manifest points at that tag's parts in `dist/factory/`, and
+pushes the tag first, so the release
+points at the commit that was built rather than one GitHub would create from
+the draft's target branch. It refuses if origin already has the tag on another
+commit. It then uploads the DMG and the factory parts to the draft release with
+that tag, replacing earlier uploads; a draft named `vX.Y.Z` with no tag yet gets
+the tag selected. Without a draft it creates one. A published release is never
+changed. Review the draft on GitHub and publish it yourself: until then its
+assets are private and the app cannot download the image.
+
+The filename stays the same for every release; the app inside is stamped with
+the version from the release tag.
+
+The compressed factory image is over GitHub's 2 GiB asset limit, so it is not
+inside the DMG. Production builds split it into 1 GiB parts in `dist/factory/`
+(`scripts/split-factory-image.py`) and give the app a manifest with each part's
+URL, size and SHA-256 digest. The URLs point at
+`https://github.com/omacom/try-omarchy/releases/download/vX.Y.Z/`, so the parts
+must be uploaded to the release with the same tag, under their generated names,
+before the release is published. A release without them cannot create a new
+VM; existing VMs are unaffected.
 
 Always upload the DMG as `TryOmarchy.dmg` so older app release checkers and the
 website's stable download link continue to work:
 <https://github.com/omacom/try-omarchy/releases/latest/download/TryOmarchy.dmg>.
 
-When the release updates Omarchy itself, first run:
-
-```sh
-make update-omarchy OMARCHY_RELEASE=x.y.z
-```
-
-Review both the upstream source change and the regenerated ARM64 package lock
-before continuing with the normal build and verification sequence.
+The factory installs whatever Omarchy's `edge` repositories serve when it is
+built, and development builds reuse it until its own inputs change. A release
+ships a factory that matches what upstream serves now without rebuilding one
+that already does: `make release` asks `scripts/factory-freshness.py --check`
+to compare every repository database the factory was built from (`[omarchy]`,
+`[core]`, `[extra]`, `[alarm]` and `[aur]`) and the Node.js release it bundles
+with upstream's current ones. It reuses the cached factory only when all of
+them match, so a second release minutes after the first skips the factory
+build; otherwise, or when the check cannot reach upstream, it rebuilds it.
+`make release FORCE=1` rebuilds it regardless. Review
+`dist/guest/factory.json` and `dist/guest/packages.txt` before publishing.
+Existing VMs update themselves with `omarchy update` either way.
 
 Outputs are written to:
 
@@ -78,8 +104,8 @@ Outputs are written to:
 `make package` and `make release` both create distributable builds: they sign
 the app and DMG with Developer ID, submit the DMG to Apple's notarization
 service, and staple the resulting tickets. Neither command falls back to an
-unnotarized build. Both commands first ensure the content-hashed guest and
-runtime artifacts are current; packaging and signing themselves always run
+unnotarized build. Both commands first ensure the content-hashed guest,
+runtime and firmware artifacts are current; packaging and signing themselves always run
 freshly. Development stays at `dist/app.noindex/Try Omarchy.app` with a separate
 bundle ID and privacy grants, so production permission flows can be tested
 independently. Another maintainer can override the release defaults:
@@ -93,6 +119,8 @@ make release VERSION=vX.Y.Z \
 ## Release checklist
 
 1. Confirm `main` is clean and all pinned inputs have reviewable provenance.
+   Record the factory's `[omarchy]` database digest and Omarchy version from
+   `dist/guest/factory.json`.
 2. Run all tests and perform a first-boot provisioning test on a clean Mac user.
 3. Verify networking, display scaling, keyboard/mouse, microphone and camera permission,
    on-demand FaceTime HD capture, audio-device changes, clipboard sharing in both
@@ -103,32 +131,28 @@ make release VERSION=vX.Y.Z \
    restart preserves the persistent VM, and the documented endpoint-specific
    host-key recovery works after Reset/ephemeral replacement. Inspect the
    factory image to confirm it contains no SSH host private keys.
-4. Install the release over a provisioned VM created by a different guest
-   build. Confirm launch preserves its disk and user data, selects the saved
-   boot kit instead of the release's bundled kernel/initramfs, and does not
-   materialize or charge free space for the new factory disk. For a schema-2 VM
-   without a boot kit, confirm the one-time read-only `/boot` export completes,
-   but only after the pre-launch dialog appears. Confirm **Cancel** starts no
-   QEMU process and changes no disk contents; confirm **Continue** performs the
-   recovery, the environment powers off without entering the old userspace,
-   and later launches do not repeat it. Separately confirm that new, reset, and
-   ephemeral VMs use the current factory.
+4. Install the release over a provisioned VM created by an earlier release.
+   Confirm launch preserves its disk and user data, the guest takes the
+   bundled `try-omarchy` package when it is newer (start menu **Omarchy** row),
+   and `omarchy update` still completes. Separately confirm that new, reset,
+   and ephemeral VMs use the current factory.
 5. Verify the app and DMG signatures with Apple's tools and confirm notarization.
-6. Audit `THIRD_PARTY_NOTICES.md`, the bundle's license material, the guest
-   package lock, and QEMU corresponding-source obligations.
+6. Audit `THIRD_PARTY_NOTICES.md`, the bundle's license material, the
+   factory's `packages.txt`, and QEMU and edk2 corresponding-source obligations.
 7. State in release notes that installing the app preserves existing VM
-   contents. Do not claim that the built-in updater reproduces factory changes:
-   the direct-boot kernel and headers, `try-omarchy-runtime`, and reviewed
-   backports remain pinned until an explicit in-guest migration channel exists.
+   contents and that Omarchy inside the VM updates through `omarchy update`.
+   VMs created by earlier direct-boot releases are not launched by
+   this version; their disks stay in the storage folder, and **Setup > Import
+   Previous VM** copies their files into the new VM.
 8. Record SHA-256 digests for the final app archive/DMG and publish them with the
    release notes.
 
 Never publish generated artifacts from an unreviewed or locally modified build
 input.
 
-The saved boot-kit ABI is a compatibility boundary. Do not change it or remove
-support for an existing value without a reviewed preserving migration or an
-explicitly confirmed reset path.
+The guest protocols are a compatibility boundary: the host credential tokens,
+every `dev.tryomarchy.*` port, and the guest status report. Older guest
+packages must keep working with a newer app, and the reverse.
 
 ## macOS compatibility validation
 
@@ -139,7 +163,7 @@ version newer than 15.0 or strongly importing `strchrnul` (introduced in 15.4).
 These binary checks do not replace testing on the supported operating systems.
 
 Before publishing, boot the release app on macOS 15.0–15.3 and macOS 26. Verify
-Alacritty uses accelerated rendering and correctly draws text while resizing,
-check desktop rendering, and test both new and existing guests. macOS 15 must
-use EL1 without probing nested virtualization; on macOS 26, verify the existing
-EL2 probe and fallback on supported and unsupported hardware respectively.
+the default terminal draws text correctly while resizing, check desktop
+rendering, and test both new and existing guests. By default every Mac must
+use EL1 without probing nested virtualization. Turn EL2 back on by default
+only after an M3-or-newer Mac boots to the desktop at EL2.

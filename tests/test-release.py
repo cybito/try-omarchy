@@ -29,8 +29,18 @@ class ReleaseTests(unittest.TestCase):
         # Keep the actual public release/preflight recipes; substitute only the
         # expensive guest, runtime, and signed app builders at their boundaries.
         makefile = (REPOSITORY / "Makefile").read_text()
-        makefile += '\nguest runtime:\n\t@python3 "$(ROOT)/fake-component.py" "$@"\n'
+        makefile += '\nguest-package guest runtime:\n\t@python3 "$(ROOT)/fake-component.py" "$@" "$(FORCE)"\n'
         (self.root / "Makefile").write_text(makefile)
+        (self.root / "scripts/factory-freshness.py").write_text('''
+import os
+from pathlib import Path
+import sys
+out = Path(__file__).resolve().parents[1] / "dist"
+out.mkdir(exist_ok=True)
+with (out / "events").open("a") as stream:
+    stream.write("check\\n")
+sys.exit(0 if os.environ.get("FACTORY_CURRENT") else 1)
+''')
         (self.root / ".gitignore").write_text("/dist/\n/.build/\n/scripts/__pycache__/\n")
         (self.root / "source.swift").write_text("// initial source\n")
         (self.root / "fake-component.py").write_text('''
@@ -41,9 +51,13 @@ import sys
 root = Path(__file__).resolve().parent
 out = root / "dist"
 out.mkdir(exist_ok=True)
+# Like build-cache.py, which refuses anything but 0 or 1.
+if sys.argv[2] not in ("0", "1"):
+    sys.exit(f"FORCE must be 0 or 1, not {sys.argv[2]!r}")
 with (out / "events").open("a") as stream:
     tags = subprocess.check_output(["git", "tag", "--points-at", "HEAD"], text=True).strip()
-    stream.write(f"{sys.argv[1]}:{tags}\\n")
+    forced = " forced" if sys.argv[2:] == ["1"] else ""
+    stream.write(f"{sys.argv[1]}{forced}:{tags}\\n")
 if os.environ.get("FAIL_COMPONENT") == sys.argv[1]:
     sys.exit(23)
 if sys.argv[1] == "runtime":
@@ -54,6 +68,7 @@ if sys.argv[1] == "runtime":
 ''')
         builder = self.root / "macos/build-app.sh"
         builder.write_text(f'#!{sys.executable}\n' + '''
+import json
 import os
 from pathlib import Path
 import plistlib
@@ -66,13 +81,29 @@ with (out / "events").open("a") as stream:
 assert sys.argv[1:] == ["--configuration", "production", "--dmg",
     "--guest-dir", str(out / "guest"), "--sign-identity",
     "Developer ID Application: Release Tests (TEST)", "--notarize-profile", "test-profile"]
-plist = out / "Info.plist"
+app = out / "release.noindex/Try Omarchy.app"
+plist = app / "Contents/Info.plist"
+plist.parent.mkdir(parents=True, exist_ok=True)
 plist.write_bytes(plistlib.dumps({}))
 subprocess.run([sys.executable, str(root / "scripts/app_version.py"),
     "--root", str(root), "--plist", str(plist)], check=True)
+if os.environ.get("WRONG_APP_VERSION"):
+    info = plistlib.loads(plist.read_bytes())
+    info["CFBundleShortVersionString"] = os.environ["WRONG_APP_VERSION"]
+    plist.write_bytes(plistlib.dumps(info))
 if os.environ.get("FAIL_PACKAGE"):
     sys.exit(24)
-(out / "TryOmarchy.dmg").write_text("test DMG\\n")
+(out / os.environ.get("DMG_NAME", "TryOmarchy.dmg")).write_text("test DMG\\n")
+tag = plistlib.loads(plist.read_bytes())["TryOmarchyBuildDescribe"]
+part = out / "factory/omarchy-aarch64-edge.img.zst.001"
+part.parent.mkdir(exist_ok=True)
+part.write_text("image")
+url = f"https://github.com/omacom/try-omarchy/releases/download/{tag}/{part.name}"
+if os.environ.get("WRONG_FACTORY_URL"):
+    url = url.replace(tag, "v0.0.1")
+manifest = app / "Contents/Resources/guest/download.json"
+manifest.parent.mkdir(parents=True, exist_ok=True)
+manifest.write_text(json.dumps({"parts": [{"url": url, "bytes": 5}]}))
 ''')
         builder.chmod(0o755)
         self.git("init", "-q")
@@ -123,14 +154,42 @@ if os.environ.get("FAIL_PACKAGE"):
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
         self.assertEqual("tag", self.git("cat-file", "-t", "refs/tags/v1.2.3"))
         self.assertEqual(self.git("rev-parse", "HEAD"), self.git("rev-parse", "v1.2.3^{commit}"))
-        self.assertEqual("guest:\nruntime:\npackage\n", (self.root / "dist/events").read_text())
+        # The cached factory no longer matches upstream, so it is rebuilt; the
+        # runtime is pinned.
+        self.assertEqual("guest-package:\nguest:\ncheck\nguest-package forced:\nguest forced:\nruntime:\npackage\n",
+                         (self.root / "dist/events").read_text())
         self.assertTrue((self.root / "dist/TryOmarchy.dmg").exists())
         self.assertIn(f"Release DMG: {self.root.resolve() / 'dist/TryOmarchy.dmg'}", result.stdout)
-        self.assertEqual("1.2.3", plistlib.loads((self.root / "dist/Info.plist").read_bytes())[
-            "CFBundleShortVersionString"])
-        self.assertIn("git push origin v1.2.3", result.stdout)
+        app_info = plistlib.loads((self.root / "dist/release.noindex/Try Omarchy.app/Contents/Info.plist").read_bytes())
+        self.assertEqual("1.2.3", app_info["CFBundleShortVersionString"])
+        self.assertEqual("v1.2.3", app_info["TryOmarchyBuildDescribe"])
+        self.assertIn("run make publish", result.stdout)
         self.assertNotIn("[y/N]", result.stdout)
         self.assertEqual("", self.git("status", "--porcelain"))
+
+    def test_a_factory_current_with_upstream_is_reused(self) -> None:
+        result = self.run_release(FACTORY_CURRENT="1")
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual("guest-package:\nguest:\ncheck\nruntime:\npackage\n",
+                         (self.root / "dist/events").read_text())
+
+    def test_force_rebuilds_the_factory_without_checking_or_forcing_the_runtime(self) -> None:
+        result = self.run_release(FACTORY_CURRENT="1", FORCE="1")
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual("guest-package forced:\nguest forced:\nruntime:\npackage\n",
+                         (self.root / "dist/events").read_text())
+
+    def test_release_factory_download_points_at_its_own_assets(self) -> None:
+        result = self.run_release(WRONG_FACTORY_URL="1")
+        self.assert_failed(result, "the factory download does not point at v1.2.3")
+
+    def test_release_requires_stable_dmg(self) -> None:
+        for name in ("TryOmarchy-v1.2.3.dmg", "TryOmarchy-v1.2.2.dmg"):
+            with self.subTest(name=name):
+                result = self.run_release(DMG_NAME=name)
+                self.assert_failed(result, "release DMG was not produced:")
+                self.assertIn("dist/TryOmarchy.dmg", result.stderr)
+                self.assertNotIn("Release DMG:", result.stdout)
 
     def test_prompt_allows_explicit_patch_minor_and_major_selection(self) -> None:
         self.git("tag", "v1.9.9")
@@ -235,7 +294,7 @@ if os.environ.get("FAIL_PACKAGE"):
             with self.subTest(environment=environment):
                 self.assert_failed(self.run_release(**environment), message)
                 self.assertEqual("", self.git("tag"))
-                self.assertNotIn("package", (self.root / "dist/events").read_text())
+                self.assertNotIn("package", (self.root / "dist/events").read_text().splitlines())
 
     def test_packaging_failure_keeps_tag_and_retry_reuses_it(self) -> None:
         self.assert_failed(self.run_release(FAIL_PACKAGE="1"), "Retry with make release VERSION=v1.2.3")
@@ -244,6 +303,11 @@ if os.environ.get("FAIL_PACKAGE"):
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
         self.assertIn("Reusing v1.2.3", result.stdout)
         self.assertEqual(original, self.git("rev-parse", "refs/tags/v1.2.3"))
+
+    def test_wrong_built_app_version_fails_release(self) -> None:
+        result = self.run_release(WRONG_APP_VERSION="1.2.2")
+        self.assert_failed(result, "built app version does not match v1.2.3")
+        self.assertEqual("v1.2.3", self.git("tag"))
 
     def test_prompt_on_tagged_head_defaults_to_rebuilding(self) -> None:
         self.git("tag", "-a", "v1.2.3", "-m", "v1.2.3")

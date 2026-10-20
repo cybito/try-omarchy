@@ -6,6 +6,7 @@ override GUEST_DIST := $(DIST)/guest
 override APP := $(DIST)/app.noindex/Try Omarchy.app
 override BUILD_CACHE := $(ROOT)/scripts/build-cache.py
 override BUILD_STATE := $(ROOT)/.build/state
+override DOWNLOAD_CACHE := $(ROOT)/.build/downloads
 RELEASE_SIGN_IDENTITY ?= Developer ID Application: Eduardo Martinez (RZC79MPD34)
 RELEASE_NOTARY_PROFILE ?= try-omarchy
 VERSION ?=
@@ -16,14 +17,14 @@ PACKAGE_NOTARY_PROFILE ?= $(RELEASE_NOTARY_PROFILE)
 FORCE ?= 0
 TEST_JOBS ?= 4
 
-SHELL_TESTS := network-helper qemu-networking qemu-port-forwarding \
-  run-qemu-ssh-contract qemu-memory-contract qemu-power-actions \
-  qemu-usb-passthrough qemu-monitor-ready qemu-persistent-storage
+SHELL_TESTS := network-helper qemu-networking qemu-port-forwarding run-qemu-gpu \
+  qemu-usb-passthrough qemu-monitor-ready
 SHELL_TEST_TARGETS := $(addprefix test-shell-,$(SHELL_TESTS))
 
 .DEFAULT_GOAL := help
-.PHONY: help doctor test guest runtime app build run run-ephemeral reset update-omarchy version-preflight package package-preflight release release-preflight clean clean-all clean-guest
-.PHONY: test-all test-contracts test-guest test-swift test-shell test-resize $(SHELL_TEST_TARGETS)
+.PHONY: help doctor test guest guest-package refresh runtime firmware app build run run-ephemeral reset version-preflight package package-preflight release release-preflight publish clean clean-all clean-guest
+.PHONY: test-all test-contracts test-guest test-swift test-shell $(SHELL_TEST_TARGETS)
+.PHONY: test-upstream test-guest-install e2e
 
 help:
 	@printf '%s\n' \
@@ -32,22 +33,28 @@ help:
 	  '  make doctor         Check the local toolchain' \
 	  '  make test           Run native and guest contract tests' \
 	  '  make test TEST_JOBS=1  Run test suites serially for debugging' \
+	  '  make test-upstream  Check the guest package against the current Omarchy (network)' \
+	  '  make test-guest-install  Install, upgrade and remove the guest package (Docker, network)' \
+	  '  make e2e            Boot a disposable VM in the app and check it end to end' \
 	  '  make build          Build only changed guest, runtime, and app inputs' \
-	  '  make build FORCE=1  Rebuild every component' \
+	  '  make build FORCE=1  Rebuild every component (the guest takes the newest Omarchy edge)' \
+	  '  make refresh        Rebuild the factory from the latest Omarchy edge, then build' \
 	  '  make run            Build the app from existing artifacts and open it' \
 	  '                      Automatically select a stable development certificate' \
 	  '  make run DEVELOPMENT_SIGN_IDENTITY="Apple Development: ..."' \
 	  '                      Choose a certificate when several are available' \
-	  '  make update-omarchy OMARCHY_RELEASE=x.y.z' \
-	  '                      Pin an upstream release and refresh the ARM64 lock' \
 	  '  make package        Create a signed and notarized distribution DMG' \
-	  '  make release        Choose a version, tag, and build a notarized DMG' \
+	  '  make release        Choose a version, tag, and build a notarized DMG (latest factory)' \
 	  '  make release VERSION=vX.Y.Z  Choose the version without prompting' \
+	  '  make release FORCE=1  Rebuild the factory even if it matches upstream' \
+	  '  make publish        Push the release tag and attach the DMG and image to its GitHub draft' \
 	  '' \
 	  'Component builds:' \
-	  '  make guest          Ensure dist/guest is current (Docker)' \
+	  '  make guest          Ensure dist/guest (try-omarchy package and factory disk) is current (Docker)' \
+	  '  make guest-package  Rebuild only the try-omarchy package; the next app build bundles it' \
 	  '  make runtime        Ensure macos/.build/qemu-gpu-runtime is current' \
-	  '  make app            Ensure both artifacts and the app are current' \
+	  '  make firmware       Stage the UEFI firmware from the pinned QEMU source' \
+	  '  make app            Ensure every artifact and the app are current' \
 	  '' \
 	  'Storage:' \
 	  '  make run-ephemeral  Run without retaining VM changes' \
@@ -69,7 +76,7 @@ test:
 
 # Start Swift early; shell integration suites consume its helper binary. Each
 # suite owns its temporary state, but SwiftPM has a single build directory.
-test-all: test-swift test-contracts test-guest test-shell test-resize
+test-all: test-swift test-contracts test-guest test-shell
 
 test-contracts:
 	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/macos/Tests/test-hda-recovery.py"
@@ -78,23 +85,50 @@ test-contracts:
 	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/macos/Tests/test-cocoa-pinch.py"
 	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/macos/Tests/test-cocoa-scroll.py"
 	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/macos/Tests/test-cocoa-iso-keyboard.py"
+	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/macos/Tests/test-cocoa-minimum-guest-size.py"
+	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/macos/Tests/test-cocoa-no-app-nap.py"
+	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/macos/Tests/test-cocoa-notch.py"
+	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/macos/Tests/test-audio-runtime-patches.py"
 	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/macos/Tests/test-cocoa-injected-text.py"
 	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/macos/Tests/test-cocoa-host-shortcuts.py"
+	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/macos/Tests/test-cocoa-keyboard-focus.py"
 	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/macos/Tests/test-hvf-memory-reclaim.py"
 	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/macos/Tests/test-hvf-mapped-sections.py"
+	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/macos/Tests/test-runtime-capabilities.py"
 	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/macos/Tests/test-virtio-pinch.py"
 	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/tests/test-build-cache.py"
+	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/tests/test-factory-freshness.py"
 	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/tests/test-profile-process.py"
 	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/tests/test-development-sign-identity.py"
 	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/tests/test-app-version.py"
 	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/tests/test-release.py"
+	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/tests/test-publish.py"
 	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/tests/test-package-dmg.py"
+	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/tests/test-split-factory-image.py"
 	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/tests/test-pack-app-icon.py"
 	@$(ROOT)/macos/Tests/macos-compatibility.test.sh
 	@$(ROOT)/macos/Tests/runtime-relocation.test.sh
 
 test-guest:
-	@$(ROOT)/guest/test
+	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/guest/package/tests/test_package.py"
+
+# The package's contracts with the Omarchy the factory installs today.
+test-upstream:
+	@rm -rf "$(ROOT)/.build/upstream-omarchy"
+	@"$(ROOT)/guest/tests/fetch-upstream.sh" "$(ROOT)/.build/upstream-omarchy"
+	@OMARCHY_UPSTREAM_ROOT="$(ROOT)/.build/upstream-omarchy" PYTHONDONTWRITEBYTECODE=1 \
+	  python3 "$(ROOT)/guest/package/tests/test_upstream.py"
+
+# A disposable VM in the built app, first boot to second boot (tests/e2e/run.sh).
+E2E_ARGS ?=
+e2e:
+	@"$(ROOT)/tests/e2e/run.sh" --app "$(APP)" $(E2E_ARGS)
+
+# The package installed, upgraded from BASE (default: the main branch) and
+# removed against Omarchy's live repositories, in the guest builder image.
+BASE ?= main
+test-guest-install:
+	@"$(ROOT)/guest/tests/package-check.sh" --base "$(BASE)" --cache "$(ROOT)/.build/pacman-cache"
 
 test-swift:
 	@mkdir -p $(ROOT)/macos/.build/module-cache/swift $(ROOT)/macos/.build/module-cache/clang
@@ -105,20 +139,30 @@ test-shell: $(SHELL_TEST_TARGETS)
 $(SHELL_TEST_TARGETS): test-shell-%: test-swift
 	@bash "$(ROOT)/macos/Tests/$*.test.sh"
 
-test-resize: test-swift
-	@PYTHONDONTWRITEBYTECODE=1 python3 "$(ROOT)/macos/Tests/resize-vm-disk.test.py"
-
-guest:
+# The package and the factory disk are cached separately: a package change
+# rebuilds the package in seconds, and the app delivers it to every VM.
+guest: guest-package
 	@OMARCHY_FORCE_BUILD="$(FORCE)" "$(BUILD_CACHE)" \
 	  --root "$(ROOT)" --state-dir "$(BUILD_STATE)" guest -- \
-	  "$(ROOT)/guest/build-container.sh" --output "$(GUEST_DIST)"
+	  "$(ROOT)/guest/build.sh" --factory-only --output "$(GUEST_DIST)"
 
-runtime:
+guest-package:
 	@OMARCHY_FORCE_BUILD="$(FORCE)" "$(BUILD_CACHE)" \
+	  --root "$(ROOT)" --state-dir "$(BUILD_STATE)" guest-package -- \
+	  "$(ROOT)/guest/package/build.sh" --output "$(GUEST_DIST)/packages"
+
+# Pinned downloads (QEMU and its dependencies' sources, Homebrew bottles) are
+# kept here between builds and checksum-verified on every use.
+runtime:
+	@OMARCHY_FORCE_BUILD="$(FORCE)" OMARCHY_DOWNLOAD_CACHE="$(DOWNLOAD_CACHE)" "$(BUILD_CACHE)" \
 	  --root "$(ROOT)" --state-dir "$(BUILD_STATE)" runtime -- \
 	  "$(ROOT)/macos/build-qemu-gpu-runtime.sh"
 
-app: guest runtime
+firmware:
+	@[[ -f "$(ROOT)/macos/.build/firmware/edk2-aarch64-code.fd" && "$(FORCE)" != 1 ]] || \
+	  OMARCHY_DOWNLOAD_CACHE="$(DOWNLOAD_CACHE)" "$(ROOT)/macos/stage-uefi-firmware.sh"
+
+app: guest runtime firmware
 	@identity=$$(python3 "$(ROOT)/macos/development-sign-identity.py" "$(DEVELOPMENT_SIGN_IDENTITY)") || exit 1; \
 	  OMARCHY_FORCE_BUILD="$(FORCE)" \
 	  OMARCHY_CODESIGN_IDENTITY="$$identity" \
@@ -128,6 +172,13 @@ app: guest runtime
 
 build: doctor app
 	@printf 'Build output: %s\n' "$(APP)"
+	@python3 "$(ROOT)/scripts/factory-freshness.py" --root "$(ROOT)"
+
+# The factory is cached by its inputs, not by upstream: rebuild it from what
+# Omarchy's edge repositories serve now.
+refresh:
+	@$(MAKE) --no-print-directory guest FORCE=1
+	@$(MAKE) --no-print-directory build
 
 run: app
 	@$(ROOT)/macos/open-qemu-gpu.sh
@@ -138,16 +189,6 @@ run-ephemeral: app
 reset: app
 	@$(ROOT)/macos/open-qemu-gpu.sh --reset-storage
 
-update-omarchy:
-	@[[ -n "$(strip $(OMARCHY_RELEASE))" ]] || { echo 'error: OMARCHY_RELEASE=x.y.z is required' >&2; exit 1; }
-	@$(ROOT)/guest/scripts/update-upstream-pin.py \
-	  --release "$(OMARCHY_RELEASE)" \
-	  --spec "$(ROOT)/guest/spec.json" \
-	  --cache-dir "$(ROOT)/.build/upstream"
-	@$(ROOT)/guest/build-container.sh \
-	  --refresh-package-lock "$(ROOT)/guest/packages.lock.json"
-	@$(ROOT)/guest/test --source "$(ROOT)/.build/upstream/omarchy-v$(OMARCHY_RELEASE)"
-
 version-preflight:
 	@python3 "$(ROOT)/scripts/app_version.py" --root "$(ROOT)" --require-release
 
@@ -156,7 +197,7 @@ package-preflight: version-preflight
 	@[[ -n "$(strip $(PACKAGE_NOTARY_PROFILE))" ]] || { echo 'error: PACKAGE_NOTARY_PROFILE must name a notarytool keychain profile' >&2; exit 1; }
 
 package: package-preflight
-	@$(MAKE) --no-print-directory guest runtime
+	@$(MAKE) --no-print-directory guest runtime firmware
 	@$(ROOT)/macos/build-app.sh \
 	  --configuration production \
 	  --dmg \
@@ -169,8 +210,14 @@ release-preflight:
 	@[[ -n "$(strip $(RELEASE_NOTARY_PROFILE))" ]] || { echo 'error: RELEASE_NOTARY_PROFILE must name a notarytool keychain profile' >&2; exit 1; }
 
 release: export RELEASE_MAKE := $(MAKE)
+release: export RELEASE_FORCE := $(FORCE)
 release: release-preflight
 	@python3 "$(ROOT)/scripts/release.py" --root "$(ROOT)"
+
+# Pushes the built release's tag, then uploads to the draft release with that
+# tag (or creates one). Publishing the draft stays manual.
+publish:
+	@python3 "$(ROOT)/scripts/publish.py" --root "$(ROOT)"
 
 clean:
 	@echo 'Removing repository build output and caches...'
@@ -189,7 +236,10 @@ clean:
 	  while IFS= read -r volume; do \
 	    [[ -z "$$volume" ]] || docker volume rm "$$volume" >/dev/null; \
 	  done < <(docker volume ls -q --filter label=dev.tryomarchy.role=guest-work); \
-	  docker image rm -f try-omarchy-guest-builder >/dev/null 2>&1 || true; \
+	  while IFS= read -r volume; do \
+	    [[ -z "$$volume" ]] || docker volume rm "$$volume" >/dev/null; \
+	  done < <(docker volume ls -q --filter label=dev.tryomarchy.role=upstream-work); \
+	  docker image rm -f try-omarchy-guest-builder try-omarchy-upstream-builder >/dev/null 2>&1 || true; \
 	  echo 'Removed Try Omarchy Docker builder image and guest-work volumes.'; \
 	else \
 	  echo 'Docker is unavailable; skipped project Docker cache cleanup.' >&2; \

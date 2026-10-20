@@ -2,10 +2,9 @@ import CryptoKit
 import Darwin
 import Foundation
 
-/// Small storage primitives shared by the launcher. Transaction ordering and
-/// workspace locking stay in qemu-persistent-storage.sh.
+/// Small storage primitives for copying a VM between storage folders.
 enum StorageIO {
-    static func sha256(path: String) throws -> String {
+    static func sha256(path: String, progress: ((Int64) -> Void)? = nil) throws -> String {
         let handle: FileHandle
         if path == "-" {
             handle = .standardInput
@@ -21,8 +20,11 @@ enum StorageIO {
         }
         defer { if path != "-" { try? handle.close() } }
         var digest = SHA256()
+        var completedBytes: Int64 = 0
         while let data = try handle.read(upToCount: 8 * 1024 * 1024), !data.isEmpty {
             digest.update(data: data)
+            completedBytes += Int64(data.count)
+            progress?(completedBytes)
         }
         return digest.finalize().map { String(format: "%02x", $0) }.joined()
     }

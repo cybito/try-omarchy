@@ -44,3 +44,167 @@ jobs:
       - name: Build and verify native runtime
         if: matrix.target == 'runtime'
         run: make runtime
+
+  # The guest package on Linux, the way a guest runs it: its tests on GNU
+  # tools, its shell scripts, and its contracts with the Omarchy the factory
+  # installs today (omarchy-dev and omarchy-settings-dev from the live edge
+  # repository, signatures checked against guest/keys).
+  guest-contracts:
+    name: Guest contracts (Linux)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Guest package tests
+        run: make test-guest
+
+      - name: Guest shell scripts (bash -n, ShellCheck errors)
+        run: |
+          git ls-files guest | while read -r f; do
+            if [ -f "$f" ] && head -1 "$f" | grep -qE '^#!.*\b(ba)?sh\b'; then echo "$f"; fi
+          done > "$RUNNER_TEMP/shell-files"
+          while read -r f; do bash -n "$f"; done < "$RUNNER_TEMP/shell-files"
+          command -v shellcheck >/dev/null || sudo apt-get install -yq shellcheck
+          tr '\n' '\0' < "$RUNNER_TEMP/shell-files" | xargs -0 shellcheck -S error -s bash
+
+      - name: Contracts with the current Omarchy
+        run: make test-upstream
+
+  # The package installed with its dependencies from Omarchy's live aarch64
+  # repositories, its DKMS modules built for linux-omarchy, upgraded from the
+  # base revision's package (whose version must be lower when the files
+  # changed) and removed again. The builder image and the package downloads
+  # are cached; every check runs on every change.
+  guest-package:
+    name: Guest package install (Linux)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restore the builder image
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/builder-image.tar.zst
+          key: guest-builder-${{ hashFiles('guest/factory/Containerfile', 'guest/keys/**', 'guest/vendor/**') }}
+
+      - name: Load or build the builder image
+        run: guest/tests/builder-image.sh "$RUNNER_TEMP/builder-image.tar.zst"
+
+      - name: Restore package downloads
+        id: pacman-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/pacman-cache
+          key: guest-pacman-latest
+          restore-keys: guest-pacman-
+
+      - name: Install, upgrade and remove the package
+        env:
+          GUEST_BUILDER_IMAGE: try-omarchy-guest-builder
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          base=$BASE_SHA
+          git rev-parse --verify --quiet "$base^{commit}" >/dev/null || base=$(git rev-parse HEAD^)
+          guest/tests/package-check.sh --base "$base" --cache "$RUNNER_TEMP/pacman-cache"
+
+      # Saved only when the set of packages changed (the test keeps one
+      # version of each), so most runs upload nothing.
+      - name: Name the package downloads
+        id: pacman-key
+        if: always()
+        run: echo "key=guest-pacman-$(ls "$RUNNER_TEMP/pacman-cache" 2>/dev/null | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+      - name: Save package downloads
+        if: always() && steps.pacman-key.outputs.key != steps.pacman-restore.outputs.cache-matched-key
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/pacman-cache
+          key: ${{ steps.pacman-key.outputs.key }}
+
+  # The factory's userland booted with systemd-nspawn and checked the way a
+  # user meets it (guest/tests/desktop): first-boot setup, units, Omarchy's
+  # desktop on a virtual display, keybindings, the browser, screen recording,
+  # a theme switch, the factory's apps, and apps installed the way Omarchy's
+  # Install menu does. The factory comes from the nightly Guest desktop run's
+  # cache when this change leaves its inputs alone; the change's own package
+  # is offered the way the app offers its bundled one, so the guest's update
+  # service installs it before first login. A change to the factory's inputs
+  # builds a new factory here instead.
+  guest-desktop:
+    name: Guest desktop (Linux)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Restore the builder image
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/builder-image.tar.zst
+          key: guest-builder-${{ hashFiles('guest/factory/Containerfile', 'guest/keys/**', 'guest/vendor/**') }}
+
+      - name: Load or build the builder image
+        run: guest/tests/builder-image.sh "$RUNNER_TEMP/builder-image.tar.zst"
+
+      - name: Restore the factory disk
+        id: factory
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/factory
+          key: guest-factory-${{ hashFiles('guest/factory/**', 'guest/build.sh', 'guest/keys/**', 'guest/vendor/**') }}-latest
+          restore-keys: guest-factory-${{ hashFiles('guest/factory/**', 'guest/build.sh', 'guest/keys/**', 'guest/vendor/**') }}-
+
+      - name: Build the factory disk (its inputs changed)
+        if: steps.factory.outputs.cache-matched-key == ''
+        env:
+          GUEST_BUILDER_IMAGE: try-omarchy-guest-builder
+        run: guest/build.sh --output "$RUNNER_TEMP/factory"
+
+      - name: Keep the new factory disk for later runs
+        if: steps.factory.outputs.cache-matched-key == '' && github.event_name == 'push'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/factory
+          key: guest-factory-${{ hashFiles('guest/factory/**', 'guest/build.sh', 'guest/keys/**', 'guest/vendor/**') }}-${{ github.run_id }}
+
+      - name: Build this change's package
+        if: steps.factory.outputs.cache-matched-key != ''
+        env:
+          GUEST_BUILDER_IMAGE: try-omarchy-guest-builder
+        run: guest/package/build.sh --output "$RUNNER_TEMP/package"
+
+      - name: Install systemd-nspawn
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq --no-install-recommends systemd-container
+
+      - name: Boot and check the userland
+        run: |
+          offer=()
+          for package in "$RUNNER_TEMP"/package/try-omarchy-*.pkg.tar.zst; do
+            [ -f "$package" ] && offer=(--package "$package")
+          done
+          sudo env CI_INSTALLS="ghostty kitty 1password" \
+            guest/tests/desktop/run.sh "${offer[@]}" "$RUNNER_TEMP/factory" "$RUNNER_TEMP/desktop"
+
+      - name: Summary
+        if: always()
+        run: cat "$RUNNER_TEMP/desktop/results.md" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+      - name: Keep screenshots and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: guest-desktop
+          path: ${{ runner.temp }}/desktop
+          retention-days: 14
