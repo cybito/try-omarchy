@@ -4,6 +4,10 @@ __pycache__/
 *.pem
 .env*
 
+# LLVM coverage and profiling output
+*.profraw
+*.profdata
+
 # Local secrets and Apple signing/notarization exports
 /.secrets/
 *.key
