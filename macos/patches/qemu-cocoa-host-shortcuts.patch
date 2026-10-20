@@ -7,7 +7,7 @@ through repeats and releases, and share modifier releases with guest state.
 
 --- a/ui/cocoa.m
 +++ b/ui/cocoa.m
-@@ -444,44 +444,97 @@
+@@ -444,39 +444,92 @@
  - (bool) handlePinchLocked:(NSEvent *)event;
  @end
  
@@ -64,15 +64,6 @@ through repeats and releases, and share modifier releases with guest state.
  static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEventRef cgEvent, void *userInfo)
  {
      QemuCocoaView *view = userInfo;
- 
-     /*
-      * macOS owns the tap's lifetime. A callback that returns too slowly
-      * gets the tap disabled with kCGEventTapDisabledByTimeout, and a tap
-      * can also be disabled with kCGEventTapDisabledByUserInput. Neither
-      * notification is a key event, so +[NSEvent eventWithCGEvent:] returns
-      * nil below and handleEvent would report that nothing was consumed,
-      * leaving the tap dead for the rest of the session. Turn it back on.
-      */
      if (type == kCGEventTapDisabledByTimeout ||
          type == kCGEventTapDisabledByUserInput) {
          [view reenableEventTap];
@@ -80,6 +71,10 @@ through repeats and releases, and share modifier releases with guest state.
      }
  
      NSEvent *event = [NSEvent eventWithCGEvent:cgEvent];
+     if (getenv("TRYOMARCHY_INPUT_OBSERVE_ONLY")) {
+         [view isKeyboardCaptured];
+         return cgEvent;
+     }
 +    if (type == kCGEventFlagsChanged &&
 +        (host_shortcut_modifiers & ~[event modifierFlags])) {
 +        if ([view isKeyboardCaptured]) {
